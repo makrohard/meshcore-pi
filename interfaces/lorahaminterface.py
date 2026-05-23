@@ -93,6 +93,7 @@ class LoRaHAMInterface(Interface):
         self._config_writer = None
         self._running = False
         self._discarded_rx_chunks = 0
+        self._data_write_lock = asyncio.Lock()
 
         self._validate_config()
 
@@ -383,17 +384,53 @@ class LoRaHAMInterface(Interface):
             except Exception as exc:
                 logger.debug("Error while closing LoRaHAM socket: %s", exc)
 
+    def _encode_frame(self, frame_type, payload):
+        if frame_type not in FRAMED_DATA_TYPES:
+            raise ValueError(f"unknown LoRaHAM frame type 0x{frame_type:02X}")
+
+        payload = bytes(payload)
+        payload_len = len(payload)
+
+        if frame_type in (FRAMED_DATA_TYPE_RX_PACKET, FRAMED_DATA_TYPE_TX_PACKET):
+            if payload_len == 0:
+                raise ValueError("LoRaHAM RF payload must not be empty")
+            if payload_len > self.max_packet_size:
+                raise ValueError(
+                    f"LoRaHAM RF payload too large: {payload_len} bytes"
+                )
+
+        header = bytes([
+            frame_type,
+            payload_len & 0xff,
+            (payload_len >> 8) & 0xff,
+        ])
+        return header + payload
+
+    async def _write_frame(self, frame_type, payload):
+        if self._data_writer is None:
+            raise ConnectionError("LoRaHAM data socket is not connected")
+
+        frame = self._encode_frame(frame_type, payload)
+
+        async with self._data_write_lock:
+            self._data_writer.write(frame)
+            await self._data_writer.drain()
+
     async def transmit(self, tx_packet):
         """
-        Transmit packet.
-
-        TX is intentionally not implemented in this milestone.
+        Transmit one MeshCore packet as one LoRaHAM TX_PACKET frame.
         """
-        if self.enable_tx:
-            logger.warning("LoRaHAM daemon TX requested, but TX is not implemented yet")
-        else:
+        if not self.enable_tx:
             logger.debug("LoRaHAM daemon TX disabled; packet discarded")
+            return 0
 
+        try:
+            await self._write_frame(FRAMED_DATA_TYPE_TX_PACKET, tx_packet)
+        except Exception as exc:
+            logger.error("LoRaHAM daemon TX failed: %s", exc)
+            return 0
+
+        logger.debug("Queued LoRaHAM TX packet, %s bytes", len(tx_packet))
         return 0
 
     def transmit_wait(self):
