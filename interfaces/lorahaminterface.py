@@ -22,16 +22,24 @@ VALID_BANDWIDTHS_HZ = {
     500000,
 }
 
+FRAMED_DATA_HEADER_LEN = 3
+FRAMED_DATA_TYPE_RX_PACKET = 0x01
+FRAMED_DATA_TYPE_TX_PACKET = 0x02
+FRAMED_DATA_TYPE_ERROR = 0x03
+FRAMED_DATA_TYPES = {
+    FRAMED_DATA_TYPE_RX_PACKET,
+    FRAMED_DATA_TYPE_TX_PACKET,
+    FRAMED_DATA_TYPE_ERROR,
+}
+
 
 class LoRaHAMInterface(Interface):
     """
     LoRaHAM daemon socket interface.
 
     This interface uses persistent Unix stream connections to the LoRaHAM
-    daemon data and configuration sockets. This milestone establishes the
-    connection lifecycle and configuration path only. Data socket RX is drained
-    and logged, but not yet forwarded into MeshCore until packet framing is
-    handled deliberately.
+    daemon framed data and configuration sockets. RX_PACKET frames are forwarded
+    into MeshCore as raw packet payload bytes.
     """
 
     def __init__(self, config: ConfigView):
@@ -39,7 +47,7 @@ class LoRaHAMInterface(Interface):
         self._name = "LoRaHAM daemon interface"
 
         config.set_default(get_config({
-            "data_socket": "/tmp/lora868.sock",
+            "data_socket": "/tmp/lora868f.sock",
             "config_socket": "/tmp/loraconf868.sock",
             "frequency": 869618000,
             "sf": 8,
@@ -248,26 +256,68 @@ class LoRaHAMInterface(Interface):
                 logger.warning("Discarding oversized LoRaHAM config socket buffer")
                 buffer.clear()
 
-    async def _data_reader_loop(self):
-        warned = False
+    async def _read_exact(self, reader, size, label):
+        try:
+            return await reader.readexactly(size)
+        except asyncio.IncompleteReadError as exc:
+            raise ConnectionError(
+                f"LoRaHAM {label} socket closed while reading {size} bytes"
+            ) from exc
 
-        while True:
-            data = await self._data_reader.read(self.max_packet_size)
-            if not data:
-                raise ConnectionError("LoRaHAM data socket closed")
+    def _decode_frame_header(self, header):
+        if len(header) != FRAMED_DATA_HEADER_LEN:
+            raise ValueError("invalid LoRaHAM frame header length")
 
-            self._discarded_rx_chunks += 1
-            if not warned:
-                logger.warning(
-                    "LoRaHAM data RX is connected, but packet forwarding is not "
-                    "enabled in this milestone; raw chunks are being discarded"
+        frame_type = header[0]
+        payload_len = header[1] | (header[2] << 8)
+
+        if frame_type not in FRAMED_DATA_TYPES:
+            raise ValueError(f"unknown LoRaHAM frame type 0x{frame_type:02X}")
+
+        if frame_type in (FRAMED_DATA_TYPE_RX_PACKET, FRAMED_DATA_TYPE_TX_PACKET):
+            if payload_len > self.max_packet_size:
+                raise ValueError(
+                    f"LoRaHAM RF payload too large: {payload_len} bytes"
                 )
-                warned = True
 
-            logger.debug(
-                "Discarded LoRaHAM raw RX chunk %s, %s bytes",
-                self._discarded_rx_chunks,
-                len(data),
+        return frame_type, payload_len
+
+    async def _read_frame(self, reader, label):
+        header = await self._read_exact(reader, FRAMED_DATA_HEADER_LEN, label)
+        frame_type, payload_len = self._decode_frame_header(header)
+
+        if payload_len == 0:
+            return frame_type, b""
+
+        payload = await self._read_exact(reader, payload_len, label)
+        return frame_type, payload
+
+    async def _data_reader_loop(self):
+        while True:
+            frame_type, payload = await self._read_frame(self._data_reader, "data")
+
+            if frame_type == FRAMED_DATA_TYPE_RX_PACKET:
+                if not payload:
+                    logger.warning("Ignoring empty LoRaHAM RX packet frame")
+                    continue
+
+                await self.rx_q.put(bytearray(payload))
+                logger.debug(
+                    "Queued LoRaHAM RX packet, %s bytes, rx_q=%s",
+                    len(payload),
+                    self.rx_q.qsize(),
+                )
+                continue
+
+            if frame_type == FRAMED_DATA_TYPE_ERROR:
+                logger.error(
+                    "LoRaHAM framed data error: %s",
+                    payload.decode("utf-8", errors="replace"),
+                )
+                continue
+
+            raise ConnectionError(
+                f"Unexpected LoRaHAM data frame type 0x{frame_type:02X}"
             )
 
     async def _connection_loop(self):
