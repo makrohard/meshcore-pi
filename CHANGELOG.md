@@ -1,3 +1,4 @@
 # Changelog
 
 - Add design notes for planned LoRaHAM daemon interface.
+- Add LoRaHAM daemon interface skeleton.
