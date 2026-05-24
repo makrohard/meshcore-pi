@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document describes the planned LoRaHAM daemon interface for `meshcore-pi`.
+This document describes the LoRaHAM daemon interface for `meshcore-pi`.
 
 The goal is to let `meshcore-pi` use a LoRaHAM Pi HAT through `loraham_daemon`, instead of accessing the radio chips directly over SPI/GPIO.
 
@@ -14,7 +14,7 @@ This interface is not a replacement for `loraham_daemon`.
 
 This interface does not try to support Meshtastic at the same time as MeshCore on the same physical radio.
 
-This interface does not initially change LoRaHAM daemon behavior.
+This interface expects a LoRaHAM daemon version that exposes framed data sockets.
 
 ## Target architecture
 
@@ -28,7 +28,7 @@ meshcore-pi companion, room, or repeater device
 meshcore-pi LoRaHAM daemon interface
         |
         v
-/tmp/lora868.sock and /tmp/loraconf868.sock
+/tmp/lora868f.sock and /tmp/loraconf868.sock
         |
         v
 loraham_daemon
@@ -74,7 +74,7 @@ devices = ["companion"]
 
 [interface.loraham868]
 type = "loraham"
-data_socket = "/tmp/lora868.sock"
+data_socket = "/tmp/lora868f.sock"
 config_socket = "/tmp/loraconf868.sock"
 frequency = 869618000
 sf = 8
@@ -85,7 +85,7 @@ preamble = 8
 syncword = "0x12"
 ldro = false
 txpower = 14
-enable_tx = false
+enable_tx = true
 
 [device.companion]
 type = "companion"
@@ -101,30 +101,54 @@ port = 5000
 listen = "0.0.0.0"
 ```
 
-## Initial implementation plan
+## Implementation status
 
-The implementation should be added in small steps.
+The implementation has been added in small steps.
 
 1. Add documentation and example configuration.
 2. Add a `LoRaHAMInterface` skeleton.
 3. Parse and validate socket paths and radio parameters.
 4. Open the daemon sockets without transmitting.
-5. Implement RX-only packet forwarding into `rx_q`.
-6. Add controlled TX, disabled by default.
+5. Implement framed RX packet forwarding into `rx_q`.
+6. Add controlled framed TX, enabled explicitly in the example config.
 7. Add reconnect/error handling.
 8. Document smoke tests and operating modes.
 
+## Framed daemon sockets
+
+The LoRaHAM interface uses the framed data socket variant of the LoRaHAM daemon protocol:
+
+```text
+/tmp/lora868f.sock
+/tmp/loraconf868.sock
+```
+
+The framed data socket preserves packet boundaries for MeshCore packets. The unframed raw socket is not used by this interface.
+
+## Local test status
+
+The current development branch has been locally tested with:
+
+```text
+LoRaHAM daemon framed sockets
+meshcore-pi companion TCP endpoint on 127.0.0.1:5000
+meshcore-cli public channel TX
+MeshCore Node Manager local GUI channel TX
+```
+
+The LoRaHAM daemon confirmed framed TX reception and RF transmit during the local tests.
+
 ## RX path
 
-The interface should read raw packets from the LoRaHAM daemon data socket and put them into the `meshcore-pi` receive queue.
+The interface reads framed RX_PACKET frames from the LoRaHAM daemon data socket and puts the packet payload into the `meshcore-pi` receive queue.
 
 If LoRaHAM metadata such as RSSI and SNR is not available from the data socket, the first version may pass only the packet bytes. Later versions may add metadata if the daemon exposes it.
 
 ## TX path
 
-TX must be disabled by default during early development.
+TX is controlled by the interface configuration.
 
-TX should only be enabled when the configuration explicitly sets:
+TX is enabled when the configuration explicitly sets:
 
 ```toml
 enable_tx = true

@@ -5,3 +5,4 @@
 - Add persistent LoRaHAM socket setup.
 - Add LoRaHAM framed RX parsing.
 - Add LoRaHAM framed TX writing.
+- Add LoRaHAM framed daemon example config.
