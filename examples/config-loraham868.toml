@@ -1,0 +1,45 @@
+# Example MeshCore companion configuration for LoRaHAM Pi HAT via loraham_daemon.
+#
+# Requires LoRaHAM daemon framed sockets:
+#   /tmp/lora868f.sock
+#   /tmp/loraconf868.sock
+
+interfaces = ["loraham868"]
+devices = ["companion"]
+
+[dispatcher]
+pass_internal = true
+
+[interface.loraham868]
+type = "loraham"
+data_socket = "/tmp/lora868f.sock"
+config_socket = "/tmp/loraconf868.sock"
+
+frequency = 869618000
+sf = 8
+bw = 62500
+cr = 8
+crc = true
+preamble = 8
+syncword = "0x12"
+ldro = false
+txpower = 14
+txmaxpower = 14
+
+apply_config = true
+connect_timeout = 5.0
+reconnect_delay = 5.0
+max_packet_size = 255
+
+# Enable RF TX through loraham_daemon.
+enable_tx = true
+
+[device.companion]
+name = "LoRaHAM MeshCore"
+contacts = "contacts.mesh"
+channels = 32
+channelfile = "channels.json"
+add_public_channel = true
+
+# Local companion TCP endpoint, default port 5000.
+interface = "wifi"
