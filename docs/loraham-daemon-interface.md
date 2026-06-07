@@ -76,15 +76,13 @@ devices = ["companion"]
 type = "loraham"
 data_socket = "/tmp/lora868f.sock"
 config_socket = "/tmp/loraconf868.sock"
-frequency = 869618000
-sf = 8
-bw = 62500
-cr = 8
-crc = true
-preamble = 8
-syncword = "0x12"
-ldro = false
-txpower = 14
+
+# Available presets:
+#   eu_uk_long    869.525 MHz, BW 250 kHz, SF11, CR5, TX 14 dBm
+#   eu_uk_narrow  869.618 MHz, BW 62.5 kHz, SF8, CR5, TX 14 dBm
+preset = "eu_uk_long"
+
+# Explicit values may override preset fields when needed.
 enable_tx = true
 
 [device.companion]
@@ -113,6 +111,23 @@ The implementation has been added in small steps.
 6. Add controlled framed TX, enabled explicitly in the example config.
 7. Add reconnect/error handling.
 8. Document smoke tests and operating modes.
+
+## Presets
+
+The LoRaHAM interface supports named presets for common MeshCore EU/UK radio configurations:
+
+```toml
+preset = "eu_uk_long"
+```
+
+Available presets:
+
+```text
+eu_uk_long    869.525 MHz, BW 250 kHz, SF11, CR5, TX 14 dBm
+eu_uk_narrow  869.618 MHz, BW 62.5 kHz, SF8, CR5, TX 14 dBm
+```
+
+Explicit radio fields such as `frequency`, `bw`, `sf`, `cr`, or `txpower` can still be set in the config and override the selected preset.
 
 ## Framed daemon sockets
 
@@ -176,7 +191,7 @@ Other UI paths should remain possible later, including serial companion mode, a 
 
 ## Open questions
 
-The following LoRaHAM daemon details must be verified before TX is enabled:
+The following LoRaHAM daemon details still need broader interoperability testing:
 
 - exact data socket packet boundary behavior
 - maximum payload size

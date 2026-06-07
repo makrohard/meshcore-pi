@@ -15,16 +15,18 @@ type = "loraham"
 data_socket = "/tmp/lora868f.sock"
 config_socket = "/tmp/loraconf868.sock"
 
-frequency = 869618000
-sf = 8
-bw = 62500
-cr = 8
-crc = true
-preamble = 8
-syncword = "0x12"
-ldro = false
-txpower = 14
-txmaxpower = 14
+# Available LoRaHAM presets:
+#   eu_uk_long    869.525 MHz, BW 250 kHz, SF11, CR5, TX 14 dBm
+#   eu_uk_narrow  869.618 MHz, BW 62.5 kHz, SF8, CR5, TX 14 dBm
+preset = "eu_uk_long"
+
+# Optional explicit overrides can be added below, for example:
+# frequency = 869525000
+# sf = 11
+# bw = 250000
+# cr = 5
+# txpower = 14
+# txmaxpower = 14
 
 apply_config = true
 connect_timeout = 5.0

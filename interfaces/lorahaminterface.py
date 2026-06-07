@@ -32,6 +32,26 @@ FRAMED_DATA_TYPES = {
     FRAMED_DATA_TYPE_ERROR,
 }
 
+LORAHAM_PRESETS = {
+    "eu_uk_long": {
+        "frequency": 869525000,
+        "bw": 250000,
+        "sf": 11,
+        "cr": 5,
+        "txpower": 14,
+        "txmaxpower": 14,
+    },
+    "eu_uk_narrow": {
+        "frequency": 869618000,
+        "bw": 62500,
+        "sf": 8,
+        "cr": 5,
+        "txpower": 14,
+        "txmaxpower": 14,
+    },
+}
+
+
 
 class LoRaHAMInterface(Interface):
     """
@@ -46,26 +66,33 @@ class LoRaHAMInterface(Interface):
         super().__init__()
         self._name = "LoRaHAM daemon interface"
 
-        config.set_default(get_config({
+        preset = config.get("preset", "eu_uk_long")
+        if not isinstance(preset, str):
+            raise ValueError("preset must be a string")
+        if preset not in LORAHAM_PRESETS:
+            raise ValueError(
+                "preset must be one of: "
+                + ", ".join(sorted(LORAHAM_PRESETS))
+            )
+
+        defaults = {
+            "preset": preset,
             "data_socket": "/tmp/lora868f.sock",
             "config_socket": "/tmp/loraconf868.sock",
-            "frequency": 869618000,
-            "sf": 8,
-            "bw": 62500,
-            "cr": 8,
             "crc": True,
             "preamble": 8,
             "syncword": "0x12",
             "ldro": False,
-            "txpower": 14,
-            "txmaxpower": 14,
             "enable_tx": True,
             "apply_config": True,
             "connect_timeout": 5.0,
             "reconnect_delay": 5.0,
             "max_packet_size": 255,
-        }))
+        }
+        defaults.update(LORAHAM_PRESETS[preset])
+        config.set_default(get_config(defaults))
 
+        self.preset = config.get("preset")
         self.data_socket = config.get("data_socket")
         self.config_socket = config.get("config_socket")
 
@@ -80,7 +107,7 @@ class LoRaHAMInterface(Interface):
 
         self.txpower = config.get("txpower")
         self.txmaxpower = config.get("txmaxpower", self.txpower)
-        self.enable_tx = config.get("enable_tx", False)
+        self.enable_tx = config.get("enable_tx")
 
         self.apply_config = config.get("apply_config", True)
         self.connect_timeout = config.get("connect_timeout", 5.0)
@@ -99,10 +126,11 @@ class LoRaHAMInterface(Interface):
 
         logger.debug(
             "Configured LoRaHAM daemon interface: data_socket=%s, "
-            "config_socket=%s, freq=%s Hz, bw=%s Hz, sf=%s, cr=%s, "
+            "config_socket=%s, preset=%s, freq=%s Hz, bw=%s Hz, sf=%s, cr=%s, "
             "txpower=%s dBm, tx_enabled=%s",
             self.data_socket,
             self.config_socket,
+            self.preset,
             self.freq,
             self.bw,
             self.sf,
@@ -124,6 +152,12 @@ class LoRaHAMInterface(Interface):
         raise ValueError("syncword must be an integer or integer string")
 
     def _validate_config(self):
+        if self.preset not in LORAHAM_PRESETS:
+            raise ValueError(
+                "preset must be one of: "
+                + ", ".join(sorted(LORAHAM_PRESETS))
+            )
+
         for name in ("data_socket", "config_socket"):
             value = getattr(self, name)
             if not isinstance(value, str) or value == "":
