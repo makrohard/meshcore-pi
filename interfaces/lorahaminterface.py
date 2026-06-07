@@ -59,7 +59,7 @@ class LoRaHAMInterface(Interface):
             "ldro": False,
             "txpower": 14,
             "txmaxpower": 14,
-            "enable_tx": False,
+            "enable_tx": True,
             "apply_config": True,
             "connect_timeout": 5.0,
             "reconnect_delay": 5.0,

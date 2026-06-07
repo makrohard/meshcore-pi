@@ -6,3 +6,4 @@
 - Add LoRaHAM framed RX parsing.
 - Add LoRaHAM framed TX writing.
 - Add LoRaHAM framed daemon example config.
+- Enable LoRaHAM TX by default.

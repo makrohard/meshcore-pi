@@ -146,15 +146,15 @@ If LoRaHAM metadata such as RSSI and SNR is not available from the data socket, 
 
 ## TX path
 
-TX is controlled by the interface configuration.
+TX is enabled by default for the LoRaHAM interface so that the example works without an extra TX option.
 
-TX is enabled when the configuration explicitly sets:
+TX can be disabled explicitly with:
 
 ```toml
-enable_tx = true
+enable_tx = false
 ```
 
-The TX implementation should validate packet length before writing to the daemon data socket.
+The TX implementation validates packet length before writing to the daemon data socket.
 
 ## UI and app paths
 
