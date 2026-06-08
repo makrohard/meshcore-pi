@@ -38,6 +38,8 @@ LORAHAM_PRESETS = {
         "bw": 250000,
         "sf": 11,
         "cr": 5,
+        "preamble": 16,
+        "ldro": False,
         "txpower": 14,
         "txmaxpower": 14,
     },

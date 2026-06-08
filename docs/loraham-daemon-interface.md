@@ -78,7 +78,7 @@ data_socket = "/tmp/lora868f.sock"
 config_socket = "/tmp/loraconf868.sock"
 
 # Available presets:
-#   eu_uk_long    869.525 MHz, BW 250 kHz, SF11, CR5, TX 14 dBm
+#   eu_uk_long    869.525 MHz, BW 250 kHz, SF11, CR5, preamble 16, TX 14 dBm
 #   eu_uk_narrow  869.618 MHz, BW 62.5 kHz, SF8, CR5, TX 14 dBm
 preset = "eu_uk_long"
 
@@ -123,11 +123,11 @@ preset = "eu_uk_long"
 Available presets:
 
 ```text
-eu_uk_long    869.525 MHz, BW 250 kHz, SF11, CR5, TX 14 dBm
+eu_uk_long    869.525 MHz, BW 250 kHz, SF11, CR5, preamble 16, TX 14 dBm
 eu_uk_narrow  869.618 MHz, BW 62.5 kHz, SF8, CR5, TX 14 dBm
 ```
 
-Explicit radio fields such as `frequency`, `bw`, `sf`, `cr`, or `txpower` can still be set in the config and override the selected preset.
+Explicit radio fields such as `frequency`, `bw`, `sf`, `cr`, `preamble`, `ldro`, or `txpower` can still be set in the config and override the selected preset.
 
 ## Framed daemon sockets
 

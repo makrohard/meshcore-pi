@@ -8,3 +8,4 @@
 - Add LoRaHAM framed daemon example config.
 - Enable LoRaHAM TX by default.
 - Add LoRaHAM radio presets.
+- Set LoRaHAM EU/UK long preset preamble to 16.
