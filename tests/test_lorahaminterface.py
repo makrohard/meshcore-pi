@@ -208,7 +208,6 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
             reconnect_delay=0.05,
             status_wait_timeout=0.1,
         )
-        self.interfaces.append(iface)
 
         iface._running = True
         manager = asyncio.create_task(iface._connection_loop())

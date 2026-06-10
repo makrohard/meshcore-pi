@@ -359,7 +359,7 @@ class LoRaHAMInterface(Interface):
         """
         symbol_time = (2 ** self.sf) / self.bw
         low_data_rate = 1 if self.ldro else 0
-        explicit_header = 0
+        implicit_header = 0  # IH=0 means explicit header mode.
         crc_enabled = 1 if self.crc else 0
 
         payload_symbols = 8 + max(
@@ -369,7 +369,7 @@ class LoRaHAMInterface(Interface):
                     - (4 * self.sf)
                     + 28
                     + (16 * crc_enabled)
-                    - (20 * explicit_header)
+                    - (20 * implicit_header)
                 )
                 / (4 * (self.sf - (2 * low_data_rate)))
             )
