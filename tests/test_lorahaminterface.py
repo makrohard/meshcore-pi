@@ -89,6 +89,20 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
                 timeout=1.0,
             )
 
+    async def test_busy_cached_status_is_refreshed_before_timeout(self):
+        daemon = await self.make_daemon(tx=True, cad=False)
+        iface = await self.connect_interface(
+            daemon,
+            busy_wait_timeout=0.5,
+        )
+
+        daemon.tx = False
+
+        await iface.transmit(b"refresh")
+        await daemon.wait_tx(b"refresh", timeout=1.0)
+
+        self.assertGreaterEqual(daemon.config_commands.count("GET STATUS"), 2)
+
     async def test_free_status_sends_immediately_without_tx_delay(self):
         daemon = await self.make_daemon(tx=False, cad=False)
         iface = await self.connect_interface(daemon, tx_delay=0.5)
@@ -155,6 +169,18 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn(b"no-status", daemon.tx_packets)
         self.assertGreaterEqual(daemon.config_commands.count("GET STATUS"), 1)
+
+    async def test_oversized_rx_frame_is_dropped_without_reconnect(self):
+        daemon = await self.make_daemon(tx=False, cad=False)
+        iface = await self.connect_interface(daemon, max_packet_size=4)
+
+        await daemon.send_rx(b"too-large")
+        await daemon.send_rx(b"ok")
+
+        packet = await asyncio.wait_for(iface.rx_q.get(), timeout=1.0)
+
+        self.assertEqual(packet, bytearray(b"ok"))
+        self.assertEqual(iface.rx_q.qsize(), 0)
 
     async def test_rx_packet_frame_is_forwarded_to_rx_queue(self):
         daemon = await self.make_daemon(tx=False, cad=False)

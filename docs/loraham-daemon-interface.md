@@ -51,7 +51,7 @@ Useful TX/status options:
 
 ```toml
 status_wait_timeout = 1.0
-busy_wait_timeout = 30.0
+busy_wait_timeout = 5.0
 tx_delay = 0.2
 ```
 

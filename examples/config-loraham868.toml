@@ -34,10 +34,10 @@ connect_timeout = 5.0
 reconnect_delay = 5.0
 # Status/TX guard:
 #   status_wait_timeout: wait for GET STATUS reply
-#   busy_wait_timeout: wait for TX/CAD to clear
+#   busy_wait_timeout: wait for TX/CAD to clear; blocks this dispatcher TX cycle
 #   tx_delay: settle time after busy becomes clear
 status_wait_timeout = 1.0
-busy_wait_timeout = 30.0
+busy_wait_timeout = 5.0
 tx_delay = 0.2
 max_packet_size = 255
 

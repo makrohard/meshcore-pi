@@ -91,7 +91,7 @@ class LoRaHAMInterface(Interface):
             "connect_timeout": 5.0,
             "reconnect_delay": 5.0,
             "status_wait_timeout": 1.0,
-            "busy_wait_timeout": 30.0,
+            "busy_wait_timeout": 5.0,
             "tx_delay": 0.2,
             "max_packet_size": 255,
         }
@@ -119,7 +119,7 @@ class LoRaHAMInterface(Interface):
         self.connect_timeout = config.get("connect_timeout", 5.0)
         self.reconnect_delay = config.get("reconnect_delay", 5.0)
         self.status_wait_timeout = config.get("status_wait_timeout", 1.0)
-        self.busy_wait_timeout = config.get("busy_wait_timeout", 30.0)
+        self.busy_wait_timeout = config.get("busy_wait_timeout", 5.0)
         self.tx_delay = config.get("tx_delay", 0.2)
         self.max_packet_size = config.get("max_packet_size", 255)
 
@@ -286,11 +286,12 @@ class LoRaHAMInterface(Interface):
         logger.info("LoRaHAM daemon sockets connected")
 
     async def _write_config_command(self, command):
-        if self._config_writer is None:
+        writer = self._config_writer
+        if writer is None:
             raise ConnectionError("LoRaHAM config socket is not connected")
 
-        self._config_writer.write(command.encode("ascii"))
-        await self._config_writer.drain()
+        writer.write(command.encode("ascii"))
+        await writer.drain()
 
     async def _send_config(self):
         command = self._format_config_command()
@@ -400,6 +401,11 @@ class LoRaHAMInterface(Interface):
         if not self._radio_busy():
             return True
 
+        try:
+            await self._request_status()
+        except Exception as exc:
+            logger.warning("Unable to refresh LoRaHAM busy status: %s", exc)
+
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.busy_wait_timeout
 
@@ -471,12 +477,6 @@ class LoRaHAMInterface(Interface):
         if frame_type not in FRAMED_DATA_TYPES:
             raise ValueError(f"unknown LoRaHAM frame type 0x{frame_type:02X}")
 
-        if frame_type in (FRAMED_DATA_TYPE_RX_PACKET, FRAMED_DATA_TYPE_TX_PACKET):
-            if payload_len > self.max_packet_size:
-                raise ValueError(
-                    f"LoRaHAM RF payload too large: {payload_len} bytes"
-                )
-
         return frame_type, payload_len
 
     async def _read_frame(self, reader, label):
@@ -486,12 +486,23 @@ class LoRaHAMInterface(Interface):
         if payload_len == 0:
             return frame_type, b""
 
+        if (
+            frame_type in (FRAMED_DATA_TYPE_RX_PACKET, FRAMED_DATA_TYPE_TX_PACKET)
+            and payload_len > self.max_packet_size
+        ):
+            await self._read_exact(reader, payload_len, label)
+            logger.warning("Dropping oversized LoRaHAM frame: %s bytes", payload_len)
+            return None, b""
+
         payload = await self._read_exact(reader, payload_len, label)
         return frame_type, payload
 
     async def _data_reader_loop(self):
         while True:
             frame_type, payload = await self._read_frame(self._data_reader, "data")
+
+            if frame_type is None:
+                continue
 
             if frame_type == FRAMED_DATA_TYPE_RX_PACKET:
                 if not payload:
@@ -533,20 +544,19 @@ class LoRaHAMInterface(Interface):
                     ),
                 ]
 
-                done, pending = await asyncio.wait(
-                    tasks,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
+                done = set()
+                try:
+                    done, _ = await asyncio.wait(
+                        tasks,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
                 for task in done:
                     task.result()
-
-                for task in pending:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
 
             except asyncio.CancelledError:
                 raise
@@ -603,14 +613,15 @@ class LoRaHAMInterface(Interface):
         return header + payload
 
     async def _write_frame(self, frame_type, payload):
-        if self._data_writer is None:
+        writer = self._data_writer
+        if writer is None:
             raise ConnectionError("LoRaHAM data socket is not connected")
 
         frame = self._encode_frame(frame_type, payload)
 
         async with self._data_write_lock:
-            self._data_writer.write(frame)
-            await self._data_writer.drain()
+            writer.write(frame)
+            await writer.drain()
 
     async def transmit(self, tx_packet):
         """
