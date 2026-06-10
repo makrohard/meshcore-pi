@@ -1,7 +1,10 @@
 import asyncio
 import logging
 import math
+import time
 import re
+
+from collections import deque
 
 from aiotools import current_taskgroup
 
@@ -95,6 +98,7 @@ class LoRaHAMInterface(Interface):
             "busy_wait_timeout": 5.0,
             "tx_delay": 0.2,
             "max_packet_size": 255,
+            "airtime": 10,
         }
         defaults.update(LORAHAM_PRESETS[preset])
         config.set_default(get_config(defaults))
@@ -123,6 +127,10 @@ class LoRaHAMInterface(Interface):
         self.busy_wait_timeout = config.get("busy_wait_timeout", 5.0)
         self.tx_delay = config.get("tx_delay", 0.2)
         self.max_packet_size = config.get("max_packet_size", 255)
+        self.airtime_dutycycle = config.get("airtime", 10)
+
+        self.airtime_txtimestamp = deque([0, 0, 0, 0, 0], maxlen=5)
+        self.airtime_txtime = deque([0, 0, 0, 0, 0], maxlen=5)
 
         self._data_reader = None
         self._data_writer = None
@@ -227,6 +235,14 @@ class LoRaHAMInterface(Interface):
                 raise ValueError(f"{name} must be numeric")
             if value < 0:
                 raise ValueError(f"{name} must be zero or positive")
+
+        if (
+            isinstance(self.airtime_dutycycle, bool)
+            or not isinstance(self.airtime_dutycycle, (int, float))
+        ):
+            raise ValueError("airtime must be numeric")
+        if not 0 < self.airtime_dutycycle <= 100:
+            raise ValueError("airtime must be between 0 and 100 percent")
 
     @staticmethod
     def _format_decimal(value):
@@ -665,6 +681,9 @@ class LoRaHAMInterface(Interface):
             return 0
 
         airtime_ms = self._calculate_airtime_ms(len(tx_packet))
+        self.airtime_txtimestamp.append(time.time())
+        self.airtime_txtime.append(airtime_ms)
+
         logger.debug(
             "Queued LoRaHAM TX packet, %s bytes, airtime %.2f ms",
             len(tx_packet),
@@ -674,8 +693,41 @@ class LoRaHAMInterface(Interface):
 
     def transmit_wait(self):
         """
-        Duty-cycle waiting is not implemented in this milestone.
+        Return the suggested duty-cycle wait time in seconds.
         """
+        tx_earliest = self.airtime_txtimestamp[0]
+        tx_period = time.time() - tx_earliest
+        tx_total = sum(self.airtime_txtime)
+
+        if tx_earliest <= 0 or tx_period <= 0 or tx_total <= 0:
+            return 0
+
+        duty_cycle = 100 * (tx_total / 1000) / tx_period
+        logger.debug(
+            "LoRaHAM duty cycle for last %s transmissions: %.2f%%",
+            len(self.airtime_txtimestamp),
+            duty_cycle,
+        )
+
+        for c in range(3):
+            fraction = 1 / (1 << c)
+            airtime_dutycycle = self.airtime_dutycycle * fraction
+
+            if duty_cycle > airtime_dutycycle:
+                tx_min = (
+                    tx_earliest
+                    + (tx_total / 1000) / (airtime_dutycycle / 100)
+                    - time.time()
+                ) * fraction
+
+                if tx_min > 0:
+                    logger.debug(
+                        "LoRaHAM duty-cycle wait %.2f seconds at %.2f%% limit",
+                        tx_min,
+                        airtime_dutycycle,
+                    )
+                    return tx_min
+
         return 0
 
     def get_radioconfig(self):

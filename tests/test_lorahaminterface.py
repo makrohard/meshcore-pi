@@ -1,5 +1,6 @@
 import asyncio
 import tempfile
+import time
 import unittest
 
 from configuration import get_config
@@ -127,6 +128,31 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreater(small, 0)
         self.assertGreater(large, small)
+
+    async def test_transmit_records_airtime_for_duty_cycle(self):
+        daemon = await self.make_daemon(tx=False, cad=False)
+        iface = await self.connect_interface(daemon)
+
+        airtime_ms = await iface.transmit(b"duty")
+        await daemon.wait_tx(b"duty")
+
+        self.assertGreater(airtime_ms, 0)
+        self.assertEqual(iface.airtime_txtime[-1], airtime_ms)
+        self.assertGreater(iface.airtime_txtimestamp[-1], 0)
+
+    async def test_transmit_wait_returns_wait_when_duty_cycle_exceeded(self):
+        daemon = await self.make_daemon(tx=False, cad=False)
+        iface = await self.connect_interface(daemon, airtime=10)
+
+        now = time.time()
+        iface.airtime_txtimestamp.clear()
+        iface.airtime_txtime.clear()
+
+        for _ in range(5):
+            iface.airtime_txtimestamp.append(now - 1)
+            iface.airtime_txtime.append(500)
+
+        self.assertGreater(iface.transmit_wait(), 0)
 
     async def test_busy_then_free_waits_tx_delay_before_sending(self):
         daemon = await self.make_daemon(tx=False, cad=True)

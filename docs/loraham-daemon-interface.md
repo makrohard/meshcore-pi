@@ -56,7 +56,10 @@ Useful TX/status options:
 status_wait_timeout = 1.0
 busy_wait_timeout = 5.0
 tx_delay = 0.2
+airtime = 10
 ```
+
+`airtime` is the duty-cycle limit in percent.
 
 ## Presets
 
@@ -107,8 +110,8 @@ if status is unavailable after GET STATUS:
 Packet length is validated before writing a `TX_PACKET` frame. `transmit()`
 returns calculated LoRa airtime in milliseconds for dispatcher statistics.
 
-`transmit_wait()` still returns `0`; duty-cycle waiting is not implemented in
-this interface yet.
+`transmit_wait()` uses the last five recorded LoRaHAM transmissions and returns
+a suggested wait time in seconds for the configured `airtime` duty-cycle limit.
 
 ## Tests
 
