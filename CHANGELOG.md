@@ -9,3 +9,4 @@
 - Enable LoRaHAM TX by default.
 - Add LoRaHAM radio presets.
 - Set LoRaHAM EU/UK long preset preamble to 16.
+- Add LoRaHAM status-aware TX gate.

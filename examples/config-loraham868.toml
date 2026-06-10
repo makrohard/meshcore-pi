@@ -31,6 +31,9 @@ preset = "eu_uk_long"
 apply_config = true
 connect_timeout = 5.0
 reconnect_delay = 5.0
+status_wait_timeout = 1.0
+busy_wait_timeout = 30.0
+tx_delay = 0.2
 max_packet_size = 255
 
 # Enable RF TX through loraham_daemon.

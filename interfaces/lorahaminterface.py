@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 
 from aiotools import current_taskgroup
 
@@ -89,6 +90,9 @@ class LoRaHAMInterface(Interface):
             "apply_config": True,
             "connect_timeout": 5.0,
             "reconnect_delay": 5.0,
+            "status_wait_timeout": 1.0,
+            "busy_wait_timeout": 30.0,
+            "tx_delay": 0.2,
             "max_packet_size": 255,
         }
         defaults.update(LORAHAM_PRESETS[preset])
@@ -114,6 +118,9 @@ class LoRaHAMInterface(Interface):
         self.apply_config = config.get("apply_config", True)
         self.connect_timeout = config.get("connect_timeout", 5.0)
         self.reconnect_delay = config.get("reconnect_delay", 5.0)
+        self.status_wait_timeout = config.get("status_wait_timeout", 1.0)
+        self.busy_wait_timeout = config.get("busy_wait_timeout", 30.0)
+        self.tx_delay = config.get("tx_delay", 0.2)
         self.max_packet_size = config.get("max_packet_size", 255)
 
         self._data_reader = None
@@ -123,6 +130,12 @@ class LoRaHAMInterface(Interface):
         self._running = False
         self._discarded_rx_chunks = 0
         self._data_write_lock = asyncio.Lock()
+        self._status_condition = asyncio.Condition()
+        self._tx_seen = False
+        self._cad_seen = False
+        self._radio_status = None
+        self._tx_busy = False
+        self._cad_busy = False
 
         self._validate_config()
 
@@ -204,12 +217,19 @@ class LoRaHAMInterface(Interface):
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be boolean")
 
-        for name in ("connect_timeout", "reconnect_delay"):
+        for name in ("connect_timeout", "reconnect_delay", "status_wait_timeout"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"{name} must be numeric")
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
+
+        for name in ("busy_wait_timeout", "tx_delay"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be numeric")
+            if value < 0:
+                raise ValueError(f"{name} must be zero or positive")
 
     @staticmethod
     def _format_decimal(value):
@@ -247,6 +267,8 @@ class LoRaHAMInterface(Interface):
             raise ConnectionError(f"Unable to connect LoRaHAM {label} socket {path}: {exc}") from exc
 
     async def _connect_sockets(self):
+        await self._reset_status()
+
         self._data_reader, self._data_writer = await self._open_unix_connection(
             self.data_socket,
             "data",
@@ -259,17 +281,156 @@ class LoRaHAMInterface(Interface):
         if self.apply_config:
             await self._send_config()
 
+        await self._request_status()
+
         logger.info("LoRaHAM daemon sockets connected")
 
-    async def _send_config(self):
+    async def _write_config_command(self, command):
         if self._config_writer is None:
             raise ConnectionError("LoRaHAM config socket is not connected")
 
-        command = self._format_config_command()
-        logger.info("Applying LoRaHAM radio config: %s", command.strip())
-
         self._config_writer.write(command.encode("ascii"))
         await self._config_writer.drain()
+
+    async def _send_config(self):
+        command = self._format_config_command()
+        logger.info("Applying LoRaHAM radio config: %s", command.strip())
+        await self._write_config_command(command)
+
+    async def _request_status(self):
+        logger.debug("Requesting LoRaHAM daemon status")
+        await self._write_config_command("GET STATUS\n")
+
+    async def _reset_status(self):
+        async with self._status_condition:
+            self._tx_seen = False
+            self._cad_seen = False
+            self._radio_status = None
+            self._tx_busy = False
+            self._cad_busy = False
+            self._status_condition.notify_all()
+
+    @staticmethod
+    def _parse_key_value_fields(line):
+        return {
+            key.upper(): value.upper()
+            for key, value in re.findall(r"\b([A-Z]+)=([^\s]+)", line.upper())
+        }
+
+    def _parse_conf_line(self, line):
+        fields = self._parse_key_value_fields(line)
+        if not fields:
+            return None
+
+        status = {}
+        if "RADIO" in fields:
+            status["radio"] = fields["RADIO"]
+        if "TX" in fields and fields["TX"] in ("0", "1"):
+            status["tx"] = fields["TX"] == "1"
+        if "CAD" in fields and fields["CAD"] in ("0", "1"):
+            status["cad"] = fields["CAD"] == "1"
+
+        return status or None
+
+    async def _update_status_from_line(self, line):
+        status = self._parse_conf_line(line)
+        if status is None:
+            return
+
+        async with self._status_condition:
+            if "radio" in status:
+                self._radio_status = status["radio"]
+            if "tx" in status:
+                self._tx_busy = status["tx"]
+                self._tx_seen = True
+            if "cad" in status:
+                self._cad_busy = status["cad"]
+                self._cad_seen = True
+
+            self._status_condition.notify_all()
+
+    def _status_seen(self):
+        return self._tx_seen and self._cad_seen
+
+    def _radio_busy(self):
+        return self._tx_busy or self._cad_busy
+
+    async def _ensure_status(self):
+        if self._status_seen():
+            return True
+
+        try:
+            await self._request_status()
+        except Exception as exc:
+            logger.warning("Unable to request LoRaHAM status: %s", exc)
+            return False
+
+        try:
+            async with self._status_condition:
+                await asyncio.wait_for(
+                    self._status_condition.wait_for(self._status_seen),
+                    timeout=self.status_wait_timeout,
+                )
+            return True
+        except TimeoutError:
+            logger.warning(
+                "LoRaHAM status unavailable after %.2f seconds; packet not sent",
+                self.status_wait_timeout,
+            )
+            return False
+
+    async def _wait_until_not_busy(self, timeout):
+        async with self._status_condition:
+            if not self._radio_busy():
+                return True
+
+            try:
+                await asyncio.wait_for(
+                    self._status_condition.wait_for(lambda: not self._radio_busy()),
+                    timeout=timeout,
+                )
+                return True
+            except TimeoutError:
+                return False
+
+    async def _wait_for_tx_window(self):
+        if not await self._ensure_status():
+            return False
+
+        if not self._radio_busy():
+            return True
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.busy_wait_timeout
+
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                if self._tx_busy:
+                    logger.warning(
+                        "LoRaHAM TX busy after %.2f seconds; packet not sent",
+                        self.busy_wait_timeout,
+                    )
+                    return False
+
+                if self._cad_busy:
+                    logger.warning(
+                        "LoRaHAM CAD busy after %.2f seconds; sending anyway",
+                        self.busy_wait_timeout,
+                    )
+                    return True
+
+                return True
+
+            if not await self._wait_until_not_busy(remaining):
+                continue
+
+            if self.tx_delay > 0:
+                await asyncio.sleep(self.tx_delay)
+
+            async with self._status_condition:
+                if not self._radio_busy():
+                    return True
 
     async def _config_reader_loop(self):
         buffer = bytearray()
@@ -284,10 +445,9 @@ class LoRaHAMInterface(Interface):
             while b"\n" in buffer:
                 line, _, rest = buffer.partition(b"\n")
                 buffer = bytearray(rest)
-                logger.debug(
-                    "LoRaHAM config socket: %s",
-                    line.decode(errors="replace").rstrip("\r"),
-                )
+                decoded_line = line.decode(errors="replace").rstrip("\r")
+                logger.debug("LoRaHAM config socket: %s", decoded_line)
+                await self._update_status_from_line(decoded_line)
 
             if len(buffer) > 4096:
                 logger.warning("Discarding oversized LoRaHAM config socket buffer")
@@ -458,6 +618,9 @@ class LoRaHAMInterface(Interface):
         """
         if not self.enable_tx:
             logger.debug("LoRaHAM daemon TX disabled; packet discarded")
+            return 0
+
+        if not await self._wait_for_tx_window():
             return 0
 
         try:
