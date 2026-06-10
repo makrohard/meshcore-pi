@@ -204,8 +204,3 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-
-# meshcore-pi local runtime state
-contacts.mesh
-channels.json
-meshcore.log
