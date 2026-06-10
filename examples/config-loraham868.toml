@@ -1,8 +1,9 @@
 # Example MeshCore companion configuration for LoRaHAM Pi HAT via loraham_daemon.
 #
-# Requires LoRaHAM daemon framed sockets:
+# Requires LoRaHAM daemon framed sockets and CONF status:
 #   /tmp/lora868f.sock
 #   /tmp/loraconf868.sock
+#   GET STATUS -> STATUS ... TX=0|1 CAD=0|1 ...
 
 interfaces = ["loraham868"]
 devices = ["companion"]
@@ -31,6 +32,10 @@ preset = "eu_uk_long"
 apply_config = true
 connect_timeout = 5.0
 reconnect_delay = 5.0
+# Status/TX guard:
+#   status_wait_timeout: wait for GET STATUS reply
+#   busy_wait_timeout: wait for TX/CAD to clear
+#   tx_delay: settle time after busy becomes clear
 status_wait_timeout = 1.0
 busy_wait_timeout = 30.0
 tx_delay = 0.2

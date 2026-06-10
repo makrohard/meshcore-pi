@@ -2,200 +2,136 @@
 
 ## Purpose
 
-This document describes the LoRaHAM daemon interface for `meshcore-pi`.
+This interface lets `meshcore-pi` use a LoRaHAM Pi HAT through
+`loraham_daemon`, instead of accessing the radio chips directly over SPI/GPIO.
 
-The goal is to let `meshcore-pi` use a LoRaHAM Pi HAT through `loraham_daemon`, instead of accessing the radio chips directly over SPI/GPIO.
+## Requirements
 
-## Non-goals
-
-This interface is not a MeshCore GUI.
-
-This interface is not a replacement for `loraham_daemon`.
-
-This interface does not try to support Meshtastic at the same time as MeshCore on the same physical radio.
-
-This interface expects a LoRaHAM daemon version that exposes framed data sockets.
-
-## Target architecture
+The LoRaHAM daemon must expose:
 
 ```text
-MeshCore app, Web app, or GUI
-        |
-        v
-meshcore-pi companion, room, or repeater device
-        |
-        v
-meshcore-pi LoRaHAM daemon interface
-        |
-        v
-/tmp/lora868f.sock and /tmp/loraconf868.sock
-        |
-        v
-loraham_daemon
-        |
-        v
-LoRaHAM Pi HAT radio
+/tmp/lora868f.sock      framed data socket
+/tmp/loraconf868.sock   CONF/status socket
 ```
 
-The first implementation target is the 868 MHz LoRaHAM radio. A 433 MHz configuration should use the same code with different socket paths and radio parameters.
+Required CONF commands/status lines:
+
+```text
+GET STATUS
+STATUS RADIO=READY TX=0|1 CAD=0|1 GETRSSI=0|1
+TX=0|1
+CAD=0|1
+```
+
+The unframed raw socket is not used.
 
 ## Radio ownership
 
-Only one software stack should control one physical LoRa radio at a time.
+Only one stack should control one physical LoRa radio at a time.
 
-Do not run `meshtasticd`, LoRaHAM APRS/chat/KISS clients, and `meshcore-pi` against the same LoRaHAM radio at the same time.
+Do not run `meshtasticd`, LoRaHAM APRS/chat/KISS clients, and `meshcore-pi`
+against the same LoRaHAM radio at the same time.
 
-A safe operating model is to use explicit modes:
+## Example configuration
 
-```text
-Mode 1: Meshtastic
-  meshtasticd owns the radio.
+See `examples/config-loraham868.toml`.
 
-Mode 2: LoRaHAM daemon clients
-  loraham_daemon plus APRS/chat/KISS tooling owns the radio path.
-
-Mode 3: MeshCore via LoRaHAM daemon
-  loraham_daemon runs, and meshcore-pi uses the daemon sockets.
-```
-
-## Planned interface name
-
-The planned `meshcore-pi` interface type is:
+Minimal interface block:
 
 ```toml
-type = "loraham"
-```
-
-A first 868 MHz configuration may look like this:
-
-```toml
-interfaces = ["loraham868"]
-devices = ["companion"]
-
 [interface.loraham868]
 type = "loraham"
 data_socket = "/tmp/lora868f.sock"
 config_socket = "/tmp/loraconf868.sock"
-
-# Available presets:
-#   eu_uk_long    869.525 MHz, BW 250 kHz, SF11, CR5, preamble 16, TX 14 dBm
-#   eu_uk_narrow  869.618 MHz, BW 62.5 kHz, SF8, CR5, TX 14 dBm
 preset = "eu_uk_long"
-
-# Explicit values may override preset fields when needed.
 enable_tx = true
-
-[device.companion]
-type = "companion"
-name = "LoRaHAM MeshCore"
-contacts = "contacts.mesh"
-channels = 32
-channelfile = "channels.json"
-add_public_channel = true
-interface = "wifi"
-
-[device.companion.wifi]
-port = 5000
-listen = "0.0.0.0"
 ```
 
-## Implementation status
-
-The implementation has been added in small steps.
-
-1. Add documentation and example configuration.
-2. Add a `LoRaHAMInterface` skeleton.
-3. Parse and validate socket paths and radio parameters.
-4. Open the daemon sockets without transmitting.
-5. Implement framed RX packet forwarding into `rx_q`.
-6. Add controlled framed TX, enabled explicitly in the example config.
-7. Add reconnect/error handling.
-8. Document smoke tests and operating modes.
-
-## Presets
-
-The LoRaHAM interface supports named presets for common MeshCore EU/UK radio configurations:
+Useful TX/status options:
 
 ```toml
-preset = "eu_uk_long"
+status_wait_timeout = 1.0
+busy_wait_timeout = 30.0
+tx_delay = 0.2
 ```
 
-Available presets:
+## Presets
 
 ```text
 eu_uk_long    869.525 MHz, BW 250 kHz, SF11, CR5, preamble 16, TX 14 dBm
 eu_uk_narrow  869.618 MHz, BW 62.5 kHz, SF8, CR5, TX 14 dBm
 ```
 
-Explicit radio fields such as `frequency`, `bw`, `sf`, `cr`, `preamble`, `ldro`, or `txpower` can still be set in the config and override the selected preset.
-
-## Framed daemon sockets
-
-The LoRaHAM interface uses the framed data socket variant of the LoRaHAM daemon protocol:
-
-```text
-/tmp/lora868f.sock
-/tmp/loraconf868.sock
-```
-
-The framed data socket preserves packet boundaries for MeshCore packets. The unframed raw socket is not used by this interface.
-
-## Local test status
-
-The current development branch has been locally tested with:
-
-```text
-LoRaHAM daemon framed sockets
-meshcore-pi companion TCP endpoint on 127.0.0.1:5000
-meshcore-cli public channel TX
-MeshCore Node Manager local GUI channel TX
-```
-
-The LoRaHAM daemon confirmed framed TX reception and RF transmit during the local tests.
+Explicit values such as `frequency`, `bw`, `sf`, `cr`, `preamble`, `ldro`,
+or `txpower` may override preset fields.
 
 ## RX path
 
-The interface reads framed RX_PACKET frames from the LoRaHAM daemon data socket and puts the packet payload into the `meshcore-pi` receive queue.
+The interface reads `RX_PACKET` frames from the framed data socket and puts
+the packet payload into the `meshcore-pi` receive queue.
 
-If LoRaHAM metadata such as RSSI and SNR is not available from the data socket, the first version may pass only the packet bytes. Later versions may add metadata if the daemon exposes it.
+RSSI/SNR metadata is not exposed by this first version.
 
 ## TX path
 
-TX is enabled by default for the LoRaHAM interface so that the example works without an extra TX option.
-
-TX can be disabled explicitly with:
+TX is enabled by default and can be disabled with:
 
 ```toml
 enable_tx = false
 ```
 
-The TX implementation validates packet length before writing to the daemon data socket.
-
-## UI and app paths
-
-The radio interface should stay independent of the user interface.
-
-The first practical UI test path is:
+Before TX, the interface tracks daemon `TX` and `CAD` state:
 
 ```text
-MeshCore app or Web app
-        |
-        v
-meshcore-pi companion device over WiFi, port 5000
-        |
-        v
-LoRaHAM daemon interface
+if TX=0 and CAD=0:
+  send immediately
+
+if TX=1 or CAD=1:
+  wait until TX=0 and CAD=0
+  then wait tx_delay
+  send if still clear
+
+if timeout and TX=1:
+  log warning, do not send
+
+if timeout and TX=0 but CAD=1:
+  log warning, send anyway
+
+if status is unavailable after GET STATUS:
+  log warning, do not send
 ```
 
-Other UI paths should remain possible later, including serial companion mode, a GUI wrapper, room server mode, and repeater mode.
+Packet length is validated before writing a `TX_PACKET` frame.
 
-## Open questions
+## Tests
 
-The following LoRaHAM daemon details still need broader interoperability testing:
+Functional tests use a fake LoRaHAM daemon with Unix sockets:
 
-- exact data socket packet boundary behavior
-- maximum payload size
-- whether RX metadata is available
-- expected config socket command format
-- daemon reconnect behavior
-- safe behavior when another client is already using the same radio
+```bash
+python -m unittest tests.test_lorahaminterface -v
+```
+
+Covered behavior:
+
+```text
+GET STATUS handling
+TX/CAD status tracking
+immediate TX when clear
+tx_delay after busy becomes clear
+TX-busy timeout blocks TX
+CAD-busy timeout sends anyway
+RX_PACKET forwarding
+```
+
+## Local smoke tests
+
+Tested locally with:
+
+```text
+Raspberry Pi 5 + LoRaHAM Pi HAT
+LoRaHAM daemon framed sockets
+meshcore-pi companion TCP on 127.0.0.1:5000
+MeshCore Node Manager send/receive
+```
+
+Broader peer/preset interoperability testing is still pending.

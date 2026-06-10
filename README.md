@@ -20,6 +20,10 @@ over WiFi or serial), a room server or a repeater, or several of these at
 once. As it can be configured with multiple interfaces, it is capable of
 repeating/bridging between LoRa and ESP-NOW meshes.
 
+It can also use a LoRaHAM Pi HAT through `loraham_daemon` via the
+`loraham` interface. See `docs/loraham-daemon-interface.md` and
+`examples/config-loraham868.toml`.
+
 Get started
 -----------
 
@@ -79,6 +83,13 @@ need to replace it with lgpio
 $ pip uninstall rpi.gpio
 $ pip install rpi-lgpio
 ```
+
+### Using LoRaHAM daemon interface
+
+The `loraham` interface uses LoRaHAM daemon instead of direct SPI/GPIO radio access.
+`loraham_daemon` must own the LoRaHAM Pi HAT radio.
+
+See `docs/loraham-daemon-interface.md` and `examples/config-loraham868.toml`.
 
 ### Using ESP-NOW
 
