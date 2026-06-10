@@ -18,7 +18,7 @@ config_socket = "/tmp/loraconf868.sock"
 
 # Available LoRaHAM presets:
 #   eu_uk_long    869.525 MHz, BW 250 kHz, SF11, CR5, preamble 16, TX 14 dBm
-#   eu_uk_narrow  869.618 MHz, BW 62.5 kHz, SF8, CR5, TX 14 dBm
+#   eu_uk_narrow  869.618 MHz, BW 62.5 kHz, SF8, CR5, preamble 8, TX 14 dBm
 preset = "eu_uk_long"
 
 # Optional explicit overrides can be added below, for example:

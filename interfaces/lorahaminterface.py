@@ -129,7 +129,6 @@ class LoRaHAMInterface(Interface):
         self._config_reader = None
         self._config_writer = None
         self._running = False
-        self._discarded_rx_chunks = 0
         self._data_write_lock = asyncio.Lock()
         self._status_condition = asyncio.Condition()
         self._tx_seen = False
@@ -168,12 +167,6 @@ class LoRaHAMInterface(Interface):
         raise ValueError("syncword must be an integer or integer string")
 
     def _validate_config(self):
-        if self.preset not in LORAHAM_PRESETS:
-            raise ValueError(
-                "preset must be one of: "
-                + ", ".join(sorted(LORAHAM_PRESETS))
-            )
-
         for name in ("data_socket", "config_socket"):
             value = getattr(self, name)
             if not isinstance(value, str) or value == "":
@@ -209,7 +202,10 @@ class LoRaHAMInterface(Interface):
         if not 0 <= self.txpower <= 20:
             raise ValueError("txpower must be between 0 and 20 dBm")
         if not self.txpower <= self.txmaxpower <= 20:
-            raise ValueError("txmaxpower must be between txpower and 20 dBm")
+            raise ValueError(
+                "txmaxpower must be between txpower and 20 dBm; "
+                "set txmaxpower >= txpower when overriding txpower"
+            )
         if not 1 <= self.max_packet_size <= 255:
             raise ValueError("max_packet_size must be between 1 and 255")
 

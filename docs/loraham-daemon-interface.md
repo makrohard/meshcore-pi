@@ -23,6 +23,9 @@ TX=0|1
 CAD=0|1
 ```
 
+The daemon should push `TX` and `CAD` transitions. When cached state is busy,
+the interface also sends `GET STATUS` before waiting.
+
 The unframed raw socket is not used.
 
 ## Radio ownership
@@ -59,7 +62,7 @@ tx_delay = 0.2
 
 ```text
 eu_uk_long    869.525 MHz, BW 250 kHz, SF11, CR5, preamble 16, TX 14 dBm
-eu_uk_narrow  869.618 MHz, BW 62.5 kHz, SF8, CR5, TX 14 dBm
+eu_uk_narrow  869.618 MHz, BW 62.5 kHz, SF8, CR5, preamble 8, TX 14 dBm
 ```
 
 Explicit values such as `frequency`, `bw`, `sf`, `cr`, `preamble`, `ldro`,

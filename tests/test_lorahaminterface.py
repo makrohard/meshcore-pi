@@ -68,6 +68,12 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
                 timeout=timeout,
             )
 
+    async def test_txmaxpower_error_mentions_txpower_override(self):
+        daemon = await self.make_daemon(tx=False, cad=False)
+
+        with self.assertRaisesRegex(ValueError, "set txmaxpower >= txpower"):
+            self.make_interface(daemon, txpower=20, txmaxpower=14)
+
     async def test_status_lines_track_tx_and_cad_state(self):
         daemon = await self.make_daemon(tx=False, cad=False)
         iface = await self.connect_interface(daemon)
