@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import re
 
 from aiotools import current_taskgroup
@@ -356,6 +357,33 @@ class LoRaHAMInterface(Interface):
     def _radio_busy(self):
         return self._tx_busy or self._cad_busy
 
+    def _calculate_airtime_ms(self, payload_len):
+        """
+        Return LoRa packet airtime in milliseconds.
+        """
+        symbol_time = (2 ** self.sf) / self.bw
+        low_data_rate = 1 if self.ldro else 0
+        explicit_header = 0
+        crc_enabled = 1 if self.crc else 0
+
+        payload_symbols = 8 + max(
+            math.ceil(
+                (
+                    (8 * payload_len)
+                    - (4 * self.sf)
+                    + 28
+                    + (16 * crc_enabled)
+                    - (20 * explicit_header)
+                )
+                / (4 * (self.sf - (2 * low_data_rate)))
+            )
+            * self.cr,
+            0,
+        )
+
+        airtime = (self.preamble + 4.25 + payload_symbols) * symbol_time
+        return airtime * 1000
+
     async def _ensure_status(self):
         if self._status_seen():
             return True
@@ -640,8 +668,13 @@ class LoRaHAMInterface(Interface):
             logger.error("LoRaHAM daemon TX failed: %s", exc)
             return 0
 
-        logger.debug("Queued LoRaHAM TX packet, %s bytes", len(tx_packet))
-        return 0
+        airtime_ms = self._calculate_airtime_ms(len(tx_packet))
+        logger.debug(
+            "Queued LoRaHAM TX packet, %s bytes, airtime %.2f ms",
+            len(tx_packet),
+            airtime_ms,
+        )
+        return airtime_ms
 
     def transmit_wait(self):
         """

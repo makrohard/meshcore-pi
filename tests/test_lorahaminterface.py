@@ -107,8 +107,20 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
         daemon = await self.make_daemon(tx=False, cad=False)
         iface = await self.connect_interface(daemon, tx_delay=0.5)
 
-        await asyncio.wait_for(iface.transmit(b"free"), timeout=0.2)
+        airtime_ms = await asyncio.wait_for(iface.transmit(b"free"), timeout=0.2)
         await daemon.wait_tx(b"free")
+
+        self.assertGreater(airtime_ms, 0)
+
+    async def test_calculated_airtime_grows_with_payload_size(self):
+        daemon = await self.make_daemon(tx=False, cad=False)
+        iface = await self.connect_interface(daemon)
+
+        small = iface._calculate_airtime_ms(16)
+        large = iface._calculate_airtime_ms(128)
+
+        self.assertGreater(small, 0)
+        self.assertGreater(large, small)
 
     async def test_busy_then_free_waits_tx_delay_before_sending(self):
         daemon = await self.make_daemon(tx=False, cad=True)

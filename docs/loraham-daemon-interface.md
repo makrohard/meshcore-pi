@@ -101,7 +101,11 @@ if status is unavailable after GET STATUS:
   log warning, do not send
 ```
 
-Packet length is validated before writing a `TX_PACKET` frame.
+Packet length is validated before writing a `TX_PACKET` frame. `transmit()`
+returns calculated LoRa airtime in milliseconds for dispatcher statistics.
+
+`transmit_wait()` still returns `0`; duty-cycle waiting is not implemented in
+this interface yet.
 
 ## Tests
 
