@@ -194,6 +194,41 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(packet, bytearray(b"ok"))
         self.assertEqual(iface.rx_q.qsize(), 0)
 
+    async def test_connection_loop_reconnects_after_daemon_restart(self):
+        daemon = await self.make_daemon(tx=False, cad=False)
+        iface = self.make_interface(
+            daemon,
+            connect_timeout=0.2,
+            reconnect_delay=0.05,
+            status_wait_timeout=0.1,
+        )
+        self.interfaces.append(iface)
+
+        iface._running = True
+        manager = asyncio.create_task(iface._connection_loop())
+        self.tasks.append(manager)
+
+        await daemon.wait_data_connection(timeout=1.0)
+        await self.wait_status(iface, timeout=1.0)
+
+        await daemon.send_rx(b"before")
+        before = await asyncio.wait_for(iface.rx_q.get(), timeout=1.0)
+        self.assertEqual(before, bytearray(b"before"))
+
+        await daemon.close()
+        await asyncio.sleep(0.1)
+
+        daemon2 = await self.make_daemon(tx=False, cad=False)
+        await daemon2.wait_data_connection(timeout=2.0)
+        await self.wait_status(iface, timeout=2.0)
+
+        await daemon2.send_rx(b"after")
+        after = await asyncio.wait_for(iface.rx_q.get(), timeout=1.0)
+        self.assertEqual(after, bytearray(b"after"))
+
+        iface._running = False
+        manager.cancel()
+
     async def test_rx_packet_frame_is_forwarded_to_rx_queue(self):
         daemon = await self.make_daemon(tx=False, cad=False)
         iface = await self.connect_interface(daemon)

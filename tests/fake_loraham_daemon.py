@@ -23,6 +23,8 @@ class FakeLoRaHAMDaemon:
         self.config_commands = []
         self.tx_packets = []
         self._tx_condition = asyncio.Condition()
+        self._data_connected = asyncio.Event()
+        self._config_connected = asyncio.Event()
 
     async def start(self):
         for path in (self.data_socket, self.config_socket):
@@ -95,8 +97,15 @@ class FakeLoRaHAMDaemon:
                 timeout=timeout,
             )
 
+    async def wait_data_connection(self, timeout=1.0):
+        await asyncio.wait_for(self._data_connected.wait(), timeout=timeout)
+
+    async def wait_config_connection(self, timeout=1.0):
+        await asyncio.wait_for(self._config_connected.wait(), timeout=timeout)
+
     async def _handle_config(self, reader, writer):
         self.config_writer = writer
+        self._config_connected.set()
         buffer = bytearray()
 
         try:
@@ -123,6 +132,7 @@ class FakeLoRaHAMDaemon:
 
     async def _handle_data(self, reader, writer):
         self.data_writer = writer
+        self._data_connected.set()
 
         try:
             while True:
