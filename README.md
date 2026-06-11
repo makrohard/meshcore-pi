@@ -86,7 +86,7 @@ $ pip install rpi-lgpio
 
 ### Using LoRaHAM daemon interface
 
-The `loraham` interface uses LoRaHAM daemon instead of direct SPI/GPIO radio access.
+The `loraham` interface uses `loraham_daemon` instead of direct SPI/GPIO radio access.
 `loraham_daemon` must own the LoRaHAM Pi HAT radio.
 
 See `docs/loraham-daemon-interface.md` and `examples/config-loraham868.toml`.
