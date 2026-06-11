@@ -7,6 +7,8 @@ This interface lets `meshcore-pi` use a LoRaHAM Pi HAT through
 
 ## Requirements
 
+Requires Python 3.11+ (matching the rest of `meshcore-pi`).
+
 The LoRaHAM daemon must expose:
 
 ```text

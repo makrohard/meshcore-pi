@@ -470,6 +470,9 @@ class LoRaHAMInterface(Interface):
                     )
                     return False
 
+                # Failsafe: a stuck CAD flag must not block TX forever.
+                # Persistent real channel activity should normally clear within
+                # busy_wait_timeout.
                 if self._cad_busy:
                     logger.warning(
                         "LoRaHAM CAD busy after %.2f seconds; sending anyway",
@@ -483,7 +486,9 @@ class LoRaHAMInterface(Interface):
                 continue
 
             if self.tx_delay > 0:
-                await asyncio.sleep(self.tx_delay)
+                delay = min(self.tx_delay, max(deadline - loop.time(), 0))
+                if delay > 0:
+                    await asyncio.sleep(delay)
 
             async with self._status_condition:
                 if not self._radio_busy():

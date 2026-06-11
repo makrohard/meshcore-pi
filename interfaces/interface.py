@@ -76,7 +76,6 @@ def configure_interfaces(config):
             try:
                 from . import lorahaminterface
                 i_face = lorahaminterface.LoRaHAMInterface(data)
-
                 interfaces.append(i_face)
             except Exception as e:
                 logger.error(f"Unable to configure interface {i}: {repr(e)}")

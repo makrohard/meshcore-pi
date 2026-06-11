@@ -199,15 +199,15 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
         iface = await self.connect_interface(
             daemon,
             busy_wait_timeout=1.0,
-            tx_delay=0.25,
+            tx_delay=0.5,
         )
 
         tx_task = asyncio.create_task(iface.transmit(b"settle"))
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.1)
         self.assertNotIn(b"settle", daemon.tx_packets)
 
         await daemon.set_status(cad=False)
-        await asyncio.sleep(0.10)
+        await asyncio.sleep(0.2)
         self.assertNotIn(b"settle", daemon.tx_packets)
 
         await daemon.wait_tx(b"settle", timeout=1.0)
