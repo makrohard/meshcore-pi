@@ -69,6 +69,31 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
                 timeout=timeout,
             )
 
+
+    async def test_eu_uk_narrow_preset_uses_preamble_16(self):
+        daemon = await self.make_daemon(tx=False, cad=False)
+        iface = self.make_interface(daemon, preset="eu_uk_narrow")
+
+        self.assertEqual(iface.freq, 869618000)
+        self.assertEqual(iface.bw, 62500)
+        self.assertEqual(iface.sf, 8)
+        self.assertEqual(iface.cr, 5)
+        self.assertEqual(iface.preamble, 16)
+        self.assertEqual(iface.txpower, 14)
+
+
+    async def test_eu_uk_medium_preset_uses_tested_values(self):
+        daemon = await self.make_daemon(tx=False, cad=False)
+        iface = self.make_interface(daemon, preset="eu_uk_medium")
+
+        self.assertEqual(iface.freq, 869525000)
+        self.assertEqual(iface.bw, 250000)
+        self.assertEqual(iface.sf, 10)
+        self.assertEqual(iface.cr, 5)
+        self.assertEqual(iface.preamble, 16)
+        self.assertFalse(iface.ldro)
+        self.assertEqual(iface.txpower, 14)
+
     async def test_txmaxpower_error_mentions_txpower_override(self):
         daemon = await self.make_daemon(tx=False, cad=False)
 
