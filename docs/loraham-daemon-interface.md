@@ -39,7 +39,7 @@ against the same LoRaHAM radio at the same time.
 
 See `examples/config-loraham868.toml`.
 
-Minimal interface block:
+Minimal RX-only interface block:
 
 ```toml
 [interface.loraham868]
@@ -47,7 +47,6 @@ type = "loraham"
 data_socket = "/tmp/lora868f.sock"
 config_socket = "/tmp/loraconf868.sock"
 preset = "eu_uk_long"
-enable_tx = true
 ```
 
 Useful TX/status options:
@@ -81,10 +80,10 @@ RSSI/SNR metadata is not exposed by this first version.
 
 ## TX path
 
-TX is enabled by default and can be disabled with:
+TX is disabled by default. Enable it explicitly:
 
 ```toml
-enable_tx = false
+enable_tx = true
 ```
 
 Before TX, the interface tracks daemon `TX` and `CAD` state:
@@ -134,15 +133,3 @@ CAD-busy timeout sends anyway
 RX_PACKET forwarding
 ```
 
-## Local smoke tests
-
-Tested locally with:
-
-```text
-Raspberry Pi 5 + LoRaHAM Pi HAT
-LoRaHAM daemon framed sockets
-meshcore-pi companion TCP on 127.0.0.1:5000
-MeshCore Node Manager send/receive
-```
-
-Broader peer/preset interoperability testing is still pending.

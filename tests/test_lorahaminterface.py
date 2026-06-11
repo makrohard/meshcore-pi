@@ -45,6 +45,7 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
             "status_wait_timeout": 0.1,
             "busy_wait_timeout": 0.2,
             "tx_delay": 0.05,
+            "enable_tx": True,
         }
         config_data.update(overrides)
 
@@ -93,6 +94,20 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(iface.preamble, 16)
         self.assertFalse(iface.ldro)
         self.assertEqual(iface.txpower, 14)
+
+
+    async def test_enable_tx_default_is_false(self):
+        daemon = await self.make_daemon(tx=False, cad=False)
+        iface = LoRaHAMInterface(get_config({
+            "data_socket": str(daemon.data_socket),
+            "config_socket": str(daemon.config_socket),
+            "apply_config": False,
+        }))
+        self.interfaces.append(iface)
+
+        self.assertFalse(iface.enable_tx)
+        self.assertEqual(await iface.transmit(b"default-off"), 0)
+        self.assertNotIn(b"default-off", daemon.tx_packets)
 
     async def test_txmaxpower_error_mentions_txpower_override(self):
         daemon = await self.make_daemon(tx=False, cad=False)

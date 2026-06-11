@@ -101,7 +101,7 @@ class LoRaHAMInterface(Interface):
             "preamble": 8,
             "syncword": "0x12",
             "ldro": False,
-            "enable_tx": True,
+            "enable_tx": False,
             "apply_config": True,
             "connect_timeout": 5.0,
             "reconnect_delay": 5.0,

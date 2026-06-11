@@ -45,7 +45,7 @@ max_packet_size = 255
 # Duty-cycle limit in percent, used by transmit_wait().
 airtime = 10
 
-# Enable RF TX through loraham_daemon.
+# Built-in TX default is false; enable explicitly after checking settings.
 enable_tx = true
 
 [device.companion]
