@@ -85,7 +85,6 @@ RSSI/SNR metadata is not exposed by this first version.
 TX is disabled by default. Enable it explicitly:
 
 ```toml
-enable_tx = true
 ```
 
 Before TX, the interface tracks daemon `TX` and `CAD` state:
@@ -131,7 +130,7 @@ TX/CAD status tracking
 immediate TX when clear
 tx_delay after busy becomes clear
 TX-busy timeout blocks TX
-CAD-busy timeout sends anyway
+stuck-CAD timeout failsafe
 RX_PACKET forwarding
 ```
 
