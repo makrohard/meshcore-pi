@@ -77,7 +77,7 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(iface.freq, 869618000)
         self.assertEqual(iface.bw, 62500)
         self.assertEqual(iface.sf, 8)
-        self.assertEqual(iface.cr, 5)
+        self.assertEqual(iface.cr, 8)
         self.assertEqual(iface.preamble, 16)
         self.assertEqual(iface.txpower, 14)
 

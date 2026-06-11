@@ -66,7 +66,7 @@ airtime = 10
 ```text
 eu_uk_long    869.525 MHz, BW 250 kHz, SF11, CR5, preamble 16, TX 14 dBm
 eu_uk_medium  869.525 MHz, BW 250 kHz, SF10, CR5, preamble 16, TX 14 dBm
-eu_uk_narrow  869.618 MHz, BW 62.5 kHz, SF8, CR5, preamble 16, TX 14 dBm
+eu_uk_narrow  869.618 MHz, BW 62.5 kHz, SF8, CR8, preamble 16, TX 14 dBm
 ```
 
 Explicit values such as `frequency`, `bw`, `sf`, `cr`, `preamble`, `ldro`,

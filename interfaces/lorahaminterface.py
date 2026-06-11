@@ -62,7 +62,7 @@ LORAHAM_PRESETS = {
         "frequency": 869618000,
         "bw": 62500,
         "sf": 8,
-        "cr": 5,
+        "cr": 8,
         "preamble": 16,
         "txpower": 14,
         "txmaxpower": 14,
