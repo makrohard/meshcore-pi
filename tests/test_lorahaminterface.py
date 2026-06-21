@@ -319,12 +319,78 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"x", daemon.tx_packets)
 
     async def test_tx_ready_when_managed_and_txresult(self):
-        # CADWAIT + MANAGED + TXRESULT=1 -> TX allowed.
+        # CADWAIT + RADIO=READY + MANAGED + TXRESULT=1 -> TX allowed.
         daemon = await self.make_daemon(txmode="MANAGED", txresult=1)
         iface = await self.connect_interface(daemon)
         self.assertTrue(iface._tx_ready)
         airtime = await asyncio.wait_for(iface.transmit(b"ok"), timeout=1.0)
         self.assertGreater(airtime, 0)
+
+    async def test_tx_inhibited_when_radio_failed(self):
+        # Everything valid except RADIO=FAILED -> TX inhibited.
+        daemon = await self.make_daemon(radio="FAILED")
+        iface = await self.connect_interface(daemon)
+        self.assertFalse(iface._tx_ready)
+        self.assertEqual(await asyncio.wait_for(iface.transmit(b"x"), timeout=1.0), 0)
+        self.assertNotIn(b"x", daemon.tx_packets)
+
+    # --- P1 write/stream-failure recovery -----------------------------------
+
+    async def test_stream_error_invalidates_connection(self):
+        # A drain failure may occur after the frame reached the daemon: the
+        # connection must be invalidated and a late TX_RESULT must not satisfy
+        # the next transmit().
+        daemon = await self.make_daemon(respond_to_tx=False)
+        iface = await self.connect_interface(daemon)
+
+        real_writer = iface._data_writer
+
+        class _DrainFailsWriter:
+            def __init__(self):
+                self._closing = False
+
+            def write(self, data):
+                pass  # pretend the frame (partially) went out
+
+            async def drain(self):
+                raise ConnectionError("drain failed")
+
+            def is_closing(self):
+                return self._closing
+
+            def close(self):
+                self._closing = True
+
+        stub = _DrainFailsWriter()
+        iface._data_writer = stub
+
+        result = await asyncio.wait_for(iface.transmit(b"streamfail"), timeout=1.0)
+        self.assertEqual(result, 0)
+        self.assertFalse(iface._tx_ready)
+        self.assertIsNone(iface._pending_tx_result)
+        self.assertTrue(stub.is_closing())  # reconnect forced
+
+        # A late TX_RESULT on the real socket must be discarded (no pending) and
+        # a follow-up transmit stays inhibited (closing writer + not ready).
+        real_writer.write(daemon._frame(0x04, bytes([0, 1, 1, 0])))
+        await real_writer.drain()
+        result2 = await asyncio.wait_for(iface.transmit(b"again"), timeout=1.0)
+        self.assertEqual(result2, 0)
+        self.assertIsNone(iface._pending_tx_result)
+
+    async def test_local_encode_error_keeps_connection(self):
+        # A local encode/validation error (oversized payload -> ValueError) must
+        # NOT invalidate the connection or force a reconnect.
+        daemon = await self.make_daemon()
+        iface = await self.connect_interface(daemon)
+        writer = iface._data_writer
+
+        result = await asyncio.wait_for(
+            iface.transmit(bytes(iface.max_packet_size + 1)), timeout=1.0)
+        self.assertEqual(result, 0)
+        self.assertTrue(iface._tx_ready)          # still ready
+        self.assertFalse(writer.is_closing())     # connection untouched
+        self.assertIsNone(iface._pending_tx_result)
 
     # --- P1a/P1b stale-result window ---------------------------------------
 

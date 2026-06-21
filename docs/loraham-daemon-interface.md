@@ -137,10 +137,13 @@ transaction (arm pending result -> write -> await -> consume) is serialised, so
 at most one result is outstanding at a time; the `seq` field is logged as a
 sanity check. A TX_RESULT whose payload is not exactly 4 bytes is treated as
 malformed and ignored. When TX is enabled, the interface only transmits once the
-connect handshake has verified a valid `CADWAIT` **and** `TXMODE=MANAGED` **and**
-`TXRESULT=1` (both are global per-band daemon state another client could change);
-otherwise TX is inhibited while RX keeps working. A timed-out or cancelled TX
-clears the pending slot and forces a reconnect handshake before the next TX.
+connect handshake has verified `RADIO=READY` **and** a valid `CADWAIT` **and**
+`TXMODE=MANAGED` **and** `TXRESULT=1` (`TXMODE`/`TXRESULT`/`CADWAIT` are global
+per-band daemon state another client could change); otherwise TX is inhibited
+while RX keeps working. A timed-out, cancelled, or write/stream-failed TX clears
+the pending slot, marks TX not-ready, and forces a reconnect handshake before the
+next TX (so a late TX_RESULT cannot be inherited). A purely local encode error
+returns 0 without dropping the connection.
 
 Packet length is validated before writing a `TX_PACKET` frame. `transmit()`
 returns the calculated LoRa airtime in milliseconds (on success) for dispatcher
@@ -168,8 +171,10 @@ TX result by raw wire status: OK(0) counts airtime (also OK+0x04 flag);
   BUSY(1)/CHANNEL_BUSY(2) -> 0; RADIO_NOT_READY(3)/RADIO_ERROR(4) -> 0;
   INVALID_PACKET(5)/INVALID_BAND(6) -> 0; unknown -> 0
 concurrent transmit() calls serialise (one pending result at a time)
-TX inhibited until a valid CADWAIT is known (enable_tx)
+TX inhibited unless RADIO=READY + valid CADWAIT + TXMODE=MANAGED + TXRESULT=1
 malformed TX_RESULT (not 4 bytes) ignored; timeout returns 0 + reconnect
+cancel during result wait clears slot + forces reconnect + re-raises
+write/stream error invalidates connection (reconnect); local encode error does not
 ERROR frame resolves an in-flight TX as failed
 reconnect after daemon restart
 ```

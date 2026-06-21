@@ -450,15 +450,17 @@ class LoRaHAMInterface(Interface):
                     # another client could have changed). Verify on every
                     # (re)connect handshake; RX-only clients never gate on this.
                     if self.enable_tx:
+                        radio = fields.get("RADIO")
                         txmode = fields.get("TXMODE")
                         txresult = fields.get("TXRESULT")
-                        if cadwait_ok and txmode == "MANAGED" and txresult == "1":
+                        if (cadwait_ok and radio == "READY"
+                                and txmode == "MANAGED" and txresult == "1"):
                             self._tx_ready = True
                         else:
                             logger.warning(
-                                "LoRaHAM TX not ready: CADWAIT_ok=%s TXMODE=%s "
-                                "TXRESULT=%s; TX inhibited",
-                                cadwait_ok, txmode, txresult,
+                                "LoRaHAM TX not ready: RADIO=%s CADWAIT_ok=%s "
+                                "TXMODE=%s TXRESULT=%s; TX inhibited",
+                                radio, cadwait_ok, txmode, txresult,
                             )
                     return
 
@@ -818,7 +820,19 @@ class LoRaHAMInterface(Interface):
                 )
                 self._request_reconnect()
                 return 0
+            except (ConnectionError, OSError) as exc:
+                # Stream error (e.g. drain failure): the frame may already have
+                # reached the daemon, so a late TX_RESULT could be inherited by
+                # the next transmit(). Invalidate the connection and reconnect.
+                if self._pending_tx_result is future:
+                    self._pending_tx_result = None
+                self._tx_ready = False
+                logger.error("LoRaHAM daemon TX stream error: %s", exc)
+                self._request_reconnect()
+                return 0
             except Exception as exc:
+                # Local/encode error (e.g. ValueError): nothing went out, the
+                # connection stays usable.
                 if self._pending_tx_result is future:
                     self._pending_tx_result = None
                 logger.error("LoRaHAM daemon TX failed: %s", exc)
