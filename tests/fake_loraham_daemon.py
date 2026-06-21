@@ -3,10 +3,27 @@ from pathlib import Path
 
 FRAMED_DATA_TYPE_RX_PACKET = 0x01
 FRAMED_DATA_TYPE_TX_PACKET = 0x02
+FRAMED_DATA_TYPE_ERROR = 0x03
+FRAMED_DATA_TYPE_TX_RESULT = 0x04
+
+FRAMED_DATA_SIGNAL_UNAVAILABLE = -32768
+
+TX_RESULT_STATUS_OK = 0
 
 
 class FakeLoRaHAMDaemon:
-    def __init__(self, root, *, tx=False, cad=False, respond_to_status=True):
+    def __init__(
+        self,
+        root,
+        *,
+        tx=False,
+        cad=False,
+        respond_to_status=True,
+        respond_to_tx=True,
+        tx_result_status=TX_RESULT_STATUS_OK,
+        tx_result_flags=0x01,
+        cadwait_ms=1500,
+    ):
         self.root = Path(root)
         self.data_socket = self.root / "lora868f.sock"
         self.config_socket = self.root / "loraconf868.sock"
@@ -14,6 +31,15 @@ class FakeLoRaHAMDaemon:
         self.tx = tx
         self.cad = cad
         self.respond_to_status = respond_to_status
+
+        # TX_RESULT behavior in response to a TX_PACKET.
+        self.respond_to_tx = respond_to_tx
+        self.tx_result_status = tx_result_status
+        self.tx_result_flags = tx_result_flags
+        self._tx_result_seq = 0
+
+        # Reported in the GET STATUS reply.
+        self.cadwait_ms = cadwait_ms
 
         self.data_server = None
         self.config_server = None
@@ -67,7 +93,9 @@ class FakeLoRaHAMDaemon:
     def _status_line(self):
         return (
             f"STATUS RADIO=READY TX={1 if self.tx else 0} "
-            f"CAD={1 if self.cad else 0} GETRSSI=0\n"
+            f"CAD={1 if self.cad else 0} GETRSSI=0 TXRESULT=1 TXQUEUE=1 "
+            f"CADWAIT={self.cadwait_ms} CADIDLE=250 CADPOLL=50 "
+            f"CADTXAFTERTIMEOUT=0\n"
         )
 
     async def _send_config_line(self, line):
@@ -84,10 +112,30 @@ class FakeLoRaHAMDaemon:
             self.cad = cad
             await self._send_config_line(f"CAD={1 if cad else 0}\n")
 
-    async def send_rx(self, payload):
+    def set_tx_result(self, *, status=None, flags=None, respond=None):
+        if status is not None:
+            self.tx_result_status = status
+        if flags is not None:
+            self.tx_result_flags = flags
+        if respond is not None:
+            self.respond_to_tx = respond
+
+    async def send_rx(self, payload, *, rssi_cdbm=-9000, snr_cdb=550):
         if self.data_writer is None:
             raise RuntimeError("data socket is not connected")
-        self.data_writer.write(self._frame(FRAMED_DATA_TYPE_RX_PACKET, payload))
+        meta = (
+            int(rssi_cdbm).to_bytes(2, "little", signed=True)
+            + int(snr_cdb).to_bytes(2, "little", signed=True)
+        )
+        frame = self._frame(FRAMED_DATA_TYPE_RX_PACKET, meta + bytes(payload))
+        self.data_writer.write(frame)
+        await self.data_writer.drain()
+
+    async def send_error(self, text):
+        if self.data_writer is None:
+            raise RuntimeError("data socket is not connected")
+        frame = self._frame(FRAMED_DATA_TYPE_ERROR, text.encode("utf-8"))
+        self.data_writer.write(frame)
         await self.data_writer.drain()
 
     async def wait_tx(self, payload, timeout=1.0):
@@ -102,6 +150,19 @@ class FakeLoRaHAMDaemon:
 
     async def wait_config_connection(self, timeout=1.0):
         await asyncio.wait_for(self._config_connected.wait(), timeout=timeout)
+
+    async def _send_tx_result(self):
+        if self.data_writer is None:
+            return
+        self._tx_result_seq = (self._tx_result_seq + 1) & 0xffff
+        payload = bytes([
+            self.tx_result_status & 0xff,
+            self.tx_result_flags & 0xff,
+            self._tx_result_seq & 0xff,
+            (self._tx_result_seq >> 8) & 0xff,
+        ])
+        self.data_writer.write(self._frame(FRAMED_DATA_TYPE_TX_RESULT, payload))
+        await self.data_writer.drain()
 
     async def _handle_config(self, reader, writer):
         self.config_writer = writer
@@ -145,6 +206,9 @@ class FakeLoRaHAMDaemon:
                     async with self._tx_condition:
                         self.tx_packets.append(payload)
                         self._tx_condition.notify_all()
+
+                    if self.respond_to_tx:
+                        await self._send_tx_result()
         except asyncio.IncompleteReadError:
             pass
         finally:

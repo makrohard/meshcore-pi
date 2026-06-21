@@ -1,9 +1,9 @@
 # Example MeshCore companion configuration for LoRaHAM Pi HAT via loraham_daemon.
 #
-# Requires LoRaHAM daemon framed sockets and CONF status:
-#   /tmp/lora868f.sock
-#   /tmp/loraconf868.sock
-#   GET STATUS -> STATUS ... TX=0|1 CAD=0|1 ...
+# Requires loraham_daemon 111-candidate or newer with framed sockets:
+#   /tmp/lora868f.sock      framed data (RX_PACKET incl. RSSI/SNR, TX_RESULT)
+#   /tmp/loraconf868.sock   CONF/status (GET STATUS -> ... CADWAIT=<ms> ...)
+# Channel access (CAD/LBT) is delegated to the daemon's MANAGED TX mode.
 
 interfaces = ["loraham868"]
 devices = ["companion"]
@@ -33,13 +33,10 @@ preset = "eu_uk_medium"
 apply_config = true
 connect_timeout = 5.0
 reconnect_delay = 5.0
-# Status/TX guard:
-#   status_wait_timeout: wait for GET STATUS reply
-#   busy_wait_timeout: wait for TX/CAD to clear; blocks this dispatcher TX cycle
-#   tx_delay: settle time after busy becomes clear
-status_wait_timeout = 1.0
-busy_wait_timeout = 5.0
-tx_delay = 0.2
+# TX is managed by the daemon (MANAGED mode). The interface writes one TX_PACKET
+# and waits for the daemon TX_RESULT. tx_result_margin (seconds) is added on top
+# of the daemon CADWAIT plus the packet airtime when waiting for that result.
+tx_result_margin = 1.0
 max_packet_size = 255
 
 # Duty-cycle limit in percent, used by transmit_wait().

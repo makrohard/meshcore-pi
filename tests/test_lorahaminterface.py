@@ -4,7 +4,13 @@ import time
 import unittest
 
 from configuration import get_config
-from interfaces.lorahaminterface import LoRaHAMInterface
+from interfaces.lorahaminterface import (
+    LoRaHAMInterface,
+    TX_RESULT_STATUS_OK,
+    TX_RESULT_STATUS_BUSY,
+    TX_RESULT_STATUS_CAD_TIMEOUT,
+    TX_RESULT_STATUS_RADIO_ERROR,
+)
 
 from tests.fake_loraham_daemon import FakeLoRaHAMDaemon
 
@@ -42,9 +48,7 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
             "config_socket": str(daemon.config_socket),
             "apply_config": False,
             "connect_timeout": 0.5,
-            "status_wait_timeout": 0.1,
-            "busy_wait_timeout": 0.2,
-            "tx_delay": 0.05,
+            "tx_result_margin": 0.2,
             "enable_tx": True,
         }
         config_data.update(overrides)
@@ -60,19 +64,12 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
         self.tasks.append(asyncio.create_task(iface._data_reader_loop()))
         self.tasks.append(asyncio.create_task(iface._config_reader_loop()))
 
-        await self.wait_status(iface)
         return iface
 
-    async def wait_status(self, iface, timeout=1.0):
-        async with iface._status_condition:
-            await asyncio.wait_for(
-                iface._status_condition.wait_for(iface._status_seen),
-                timeout=timeout,
-            )
-
+    # --- Config / presets ---------------------------------------------------
 
     async def test_eu_uk_narrow_preset_uses_preamble_16(self):
-        daemon = await self.make_daemon(tx=False, cad=False)
+        daemon = await self.make_daemon()
         iface = self.make_interface(daemon, preset="eu_uk_narrow")
 
         self.assertEqual(iface.freq, 869618000)
@@ -82,9 +79,8 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(iface.preamble, 16)
         self.assertEqual(iface.txpower, 14)
 
-
     async def test_eu_uk_medium_preset_uses_tested_values(self):
-        daemon = await self.make_daemon(tx=False, cad=False)
+        daemon = await self.make_daemon()
         iface = self.make_interface(daemon, preset="eu_uk_medium")
 
         self.assertEqual(iface.freq, 869525000)
@@ -95,9 +91,8 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(iface.ldro)
         self.assertEqual(iface.txpower, 14)
 
-
     async def test_enable_tx_default_is_false(self):
-        daemon = await self.make_daemon(tx=False, cad=False)
+        daemon = await self.make_daemon()
         iface = LoRaHAMInterface(get_config({
             "data_socket": str(daemon.data_socket),
             "config_socket": str(daemon.config_socket),
@@ -110,57 +105,147 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"default-off", daemon.tx_packets)
 
     async def test_txmaxpower_error_mentions_txpower_override(self):
-        daemon = await self.make_daemon(tx=False, cad=False)
+        daemon = await self.make_daemon()
 
         with self.assertRaisesRegex(ValueError, "set txmaxpower >= txpower"):
             self.make_interface(daemon, txpower=20, txmaxpower=14)
 
-    async def test_status_lines_track_tx_and_cad_state(self):
-        daemon = await self.make_daemon(tx=False, cad=False)
+    # --- Connect handshake --------------------------------------------------
+
+    async def test_connect_sets_managed_txresult_and_reads_cadwait(self):
+        daemon = await self.make_daemon(cadwait_ms=2000)
         iface = await self.connect_interface(daemon)
 
-        self.assertFalse(iface._tx_busy)
-        self.assertFalse(iface._cad_busy)
+        self.assertIn("SET TXMODE=MANAGED", daemon.config_commands)
+        self.assertIn("SET TXRESULT=1", daemon.config_commands)
+        self.assertIn("GET STATUS", daemon.config_commands)
+        self.assertEqual(iface._cadwait_s, 2.0)
 
-        await daemon.set_status(tx=True)
-        async with iface._status_condition:
-            await asyncio.wait_for(
-                iface._status_condition.wait_for(lambda: iface._tx_busy),
-                timeout=1.0,
-            )
+    async def test_rx_only_does_not_change_tx_mode(self):
+        daemon = await self.make_daemon()
+        iface = await self.connect_interface(daemon, enable_tx=False)
 
-        await daemon.set_status(cad=True)
-        async with iface._status_condition:
-            await asyncio.wait_for(
-                iface._status_condition.wait_for(lambda: iface._cad_busy),
-                timeout=1.0,
-            )
+        self.assertNotIn("SET TXMODE=MANAGED", daemon.config_commands)
+        self.assertNotIn("SET TXRESULT=1", daemon.config_commands)
+        self.assertIn("GET STATUS", daemon.config_commands)
 
-    async def test_busy_cached_status_is_refreshed_before_timeout(self):
-        daemon = await self.make_daemon(tx=True, cad=False)
-        iface = await self.connect_interface(
-            daemon,
-            busy_wait_timeout=0.5,
-        )
+    # --- RX path ------------------------------------------------------------
 
-        daemon.tx = False
+    async def test_rx_packet_yields_payload_rssi_snr_tuple(self):
+        daemon = await self.make_daemon()
+        iface = await self.connect_interface(daemon)
 
-        await iface.transmit(b"refresh")
-        await daemon.wait_tx(b"refresh", timeout=1.0)
+        await daemon.send_rx(b"rx-payload", rssi_cdbm=-9000, snr_cdb=550)
+        packet = await asyncio.wait_for(iface.rx_q.get(), timeout=1.0)
 
-        self.assertGreaterEqual(daemon.config_commands.count("GET STATUS"), 2)
+        self.assertEqual(packet, (b"rx-payload", -90.0, 5.5))
 
-    async def test_free_status_sends_immediately_without_tx_delay(self):
-        daemon = await self.make_daemon(tx=False, cad=False)
-        iface = await self.connect_interface(daemon, tx_delay=0.5)
+    async def test_rx_packet_sentinel_signal_maps_to_zero(self):
+        daemon = await self.make_daemon()
+        iface = await self.connect_interface(daemon)
 
-        airtime_ms = await asyncio.wait_for(iface.transmit(b"free"), timeout=0.2)
-        await daemon.wait_tx(b"free")
+        await daemon.send_rx(b"no-signal", rssi_cdbm=-32768, snr_cdb=-32768)
+        packet = await asyncio.wait_for(iface.rx_q.get(), timeout=1.0)
+
+        self.assertEqual(packet, (b"no-signal", 0.0, 0.0))
+
+    async def test_oversized_rx_frame_is_dropped_without_reconnect(self):
+        daemon = await self.make_daemon()
+        iface = await self.connect_interface(daemon, max_packet_size=4)
+
+        await daemon.send_rx(b"too-large")
+        await daemon.send_rx(b"ok")
+
+        rf, _rssi, _snr = await asyncio.wait_for(iface.rx_q.get(), timeout=1.0)
+
+        self.assertEqual(rf, b"ok")
+        self.assertEqual(iface.rx_q.qsize(), 0)
+
+    # --- TX path (managed, via TX_RESULT) -----------------------------------
+
+    async def test_transmit_ok_records_airtime(self):
+        daemon = await self.make_daemon(tx_result_status=TX_RESULT_STATUS_OK)
+        iface = await self.connect_interface(daemon)
+
+        airtime_ms = await asyncio.wait_for(iface.transmit(b"ok"), timeout=1.0)
+        await daemon.wait_tx(b"ok")
 
         self.assertGreater(airtime_ms, 0)
+        self.assertEqual(iface.airtime_txtime[-1], airtime_ms)
+        self.assertGreater(iface.airtime_txtimestamp[-1], 0)
+
+    async def test_transmit_busy_not_sent_and_no_dutycycle(self):
+        daemon = await self.make_daemon(tx_result_status=TX_RESULT_STATUS_BUSY)
+        iface = await self.connect_interface(daemon)
+
+        before_time = list(iface.airtime_txtime)
+        before_stamp = list(iface.airtime_txtimestamp)
+
+        result = await asyncio.wait_for(iface.transmit(b"busy"), timeout=1.0)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(list(iface.airtime_txtime), before_time)
+        self.assertEqual(list(iface.airtime_txtimestamp), before_stamp)
+
+    async def test_transmit_cad_timeout_not_sent(self):
+        daemon = await self.make_daemon(
+            tx_result_status=TX_RESULT_STATUS_CAD_TIMEOUT,
+            tx_result_flags=0x05,
+        )
+        iface = await self.connect_interface(daemon)
+
+        before_time = list(iface.airtime_txtime)
+
+        result = await asyncio.wait_for(iface.transmit(b"cad"), timeout=1.0)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(list(iface.airtime_txtime), before_time)
+
+    async def test_transmit_radio_error_returns_zero(self):
+        daemon = await self.make_daemon(tx_result_status=TX_RESULT_STATUS_RADIO_ERROR)
+        iface = await self.connect_interface(daemon)
+
+        before_time = list(iface.airtime_txtime)
+
+        result = await asyncio.wait_for(iface.transmit(b"err"), timeout=1.0)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(list(iface.airtime_txtime), before_time)
+
+    async def test_transmit_error_frame_aborts_pending(self):
+        daemon = await self.make_daemon(respond_to_tx=False)
+        iface = await self.connect_interface(daemon)
+
+        async def fail_with_error():
+            await daemon.wait_tx(b"to-err", timeout=1.0)
+            await daemon.send_error("recoverable TX failure")
+
+        helper = asyncio.create_task(fail_with_error())
+        self.tasks.append(helper)
+
+        result = await asyncio.wait_for(iface.transmit(b"to-err"), timeout=1.0)
+        self.assertEqual(result, 0)
+
+    async def test_transmit_timeout_triggers_reconnect(self):
+        daemon = await self.make_daemon(respond_to_tx=False, cadwait_ms=10)
+        iface = await self.connect_interface(
+            daemon,
+            sf=7,
+            bw=500000,
+            tx_result_margin=0.05,
+        )
+
+        writer = iface._data_writer
+
+        result = await asyncio.wait_for(iface.transmit(b"timeout"), timeout=1.0)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(writer.is_closing())
+
+    # --- Duty cycle ---------------------------------------------------------
 
     async def test_calculated_airtime_grows_with_payload_size(self):
-        daemon = await self.make_daemon(tx=False, cad=False)
+        daemon = await self.make_daemon()
         iface = await self.connect_interface(daemon)
 
         small = iface._calculate_airtime_ms(16)
@@ -169,19 +254,8 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(small, 0)
         self.assertGreater(large, small)
 
-    async def test_transmit_records_airtime_for_duty_cycle(self):
-        daemon = await self.make_daemon(tx=False, cad=False)
-        iface = await self.connect_interface(daemon)
-
-        airtime_ms = await iface.transmit(b"duty")
-        await daemon.wait_tx(b"duty")
-
-        self.assertGreater(airtime_ms, 0)
-        self.assertEqual(iface.airtime_txtime[-1], airtime_ms)
-        self.assertGreater(iface.airtime_txtimestamp[-1], 0)
-
     async def test_transmit_wait_returns_wait_when_duty_cycle_exceeded(self):
-        daemon = await self.make_daemon(tx=False, cad=False)
+        daemon = await self.make_daemon()
         iface = await self.connect_interface(daemon, airtime=10)
 
         now = time.time()
@@ -194,85 +268,15 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreater(iface.transmit_wait(), 0)
 
-    async def test_busy_then_free_waits_tx_delay_before_sending(self):
-        daemon = await self.make_daemon(tx=False, cad=True)
-        iface = await self.connect_interface(
-            daemon,
-            busy_wait_timeout=1.0,
-            tx_delay=0.5,
-        )
-
-        tx_task = asyncio.create_task(iface.transmit(b"settle"))
-        await asyncio.sleep(0.1)
-        self.assertNotIn(b"settle", daemon.tx_packets)
-
-        await daemon.set_status(cad=False)
-        await asyncio.sleep(0.2)
-        self.assertNotIn(b"settle", daemon.tx_packets)
-
-        await daemon.wait_tx(b"settle", timeout=1.0)
-        await tx_task
-
-    async def test_tx_busy_timeout_does_not_send(self):
-        daemon = await self.make_daemon(tx=True, cad=False)
-        iface = await self.connect_interface(
-            daemon,
-            busy_wait_timeout=0.05,
-        )
-
-        await iface.transmit(b"blocked")
-        await asyncio.sleep(0.05)
-
-        self.assertNotIn(b"blocked", daemon.tx_packets)
-
-    async def test_cad_busy_timeout_sends_anyway(self):
-        daemon = await self.make_daemon(tx=False, cad=True)
-        iface = await self.connect_interface(
-            daemon,
-            busy_wait_timeout=0.05,
-        )
-
-        await iface.transmit(b"cad-timeout")
-
-        await daemon.wait_tx(b"cad-timeout", timeout=1.0)
-
-    async def test_missing_status_after_get_status_does_not_send(self):
-        daemon = await self.make_daemon(respond_to_status=False)
-        iface = self.make_interface(
-            daemon,
-            status_wait_timeout=0.05,
-            busy_wait_timeout=0.05,
-        )
-        await iface._connect_sockets()
-
-        self.tasks.append(asyncio.create_task(iface._data_reader_loop()))
-        self.tasks.append(asyncio.create_task(iface._config_reader_loop()))
-
-        await iface.transmit(b"no-status")
-        await asyncio.sleep(0.05)
-
-        self.assertNotIn(b"no-status", daemon.tx_packets)
-        self.assertGreaterEqual(daemon.config_commands.count("GET STATUS"), 1)
-
-    async def test_oversized_rx_frame_is_dropped_without_reconnect(self):
-        daemon = await self.make_daemon(tx=False, cad=False)
-        iface = await self.connect_interface(daemon, max_packet_size=4)
-
-        await daemon.send_rx(b"too-large")
-        await daemon.send_rx(b"ok")
-
-        packet = await asyncio.wait_for(iface.rx_q.get(), timeout=1.0)
-
-        self.assertEqual(packet, bytearray(b"ok"))
-        self.assertEqual(iface.rx_q.qsize(), 0)
+    # --- Reconnect ----------------------------------------------------------
 
     async def test_connection_loop_reconnects_after_daemon_restart(self):
-        daemon = await self.make_daemon(tx=False, cad=False)
+        daemon = await self.make_daemon()
         iface = self.make_interface(
             daemon,
             connect_timeout=0.2,
             reconnect_delay=0.05,
-            status_wait_timeout=0.1,
+            enable_tx=False,
         )
 
         iface._running = True
@@ -280,34 +284,23 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
         self.tasks.append(manager)
 
         await daemon.wait_data_connection(timeout=1.0)
-        await self.wait_status(iface, timeout=1.0)
 
         await daemon.send_rx(b"before")
-        before = await asyncio.wait_for(iface.rx_q.get(), timeout=1.0)
-        self.assertEqual(before, bytearray(b"before"))
+        rf, _rssi, _snr = await asyncio.wait_for(iface.rx_q.get(), timeout=1.0)
+        self.assertEqual(rf, b"before")
 
         await daemon.close()
         await asyncio.sleep(0.1)
 
-        daemon2 = await self.make_daemon(tx=False, cad=False)
+        daemon2 = await self.make_daemon()
         await daemon2.wait_data_connection(timeout=2.0)
-        await self.wait_status(iface, timeout=2.0)
 
         await daemon2.send_rx(b"after")
-        after = await asyncio.wait_for(iface.rx_q.get(), timeout=1.0)
-        self.assertEqual(after, bytearray(b"after"))
+        rf2, _rssi2, _snr2 = await asyncio.wait_for(iface.rx_q.get(), timeout=2.0)
+        self.assertEqual(rf2, b"after")
 
         iface._running = False
         manager.cancel()
-
-    async def test_rx_packet_frame_is_forwarded_to_rx_queue(self):
-        daemon = await self.make_daemon(tx=False, cad=False)
-        iface = await self.connect_interface(daemon)
-
-        await daemon.send_rx(b"rx-payload")
-        packet = await asyncio.wait_for(iface.rx_q.get(), timeout=1.0)
-
-        self.assertEqual(packet, bytearray(b"rx-payload"))
 
 
 if __name__ == "__main__":

@@ -31,11 +31,37 @@ FRAMED_DATA_HEADER_LEN = 3
 FRAMED_DATA_TYPE_RX_PACKET = 0x01
 FRAMED_DATA_TYPE_TX_PACKET = 0x02
 FRAMED_DATA_TYPE_ERROR = 0x03
+FRAMED_DATA_TYPE_TX_RESULT = 0x04
 FRAMED_DATA_TYPES = {
     FRAMED_DATA_TYPE_RX_PACKET,
     FRAMED_DATA_TYPE_TX_PACKET,
     FRAMED_DATA_TYPE_ERROR,
+    FRAMED_DATA_TYPE_TX_RESULT,
 }
+
+# RX_PACKET payload: [rssi_cdbm i16 LE][snr_cdb i16 LE][RF payload].
+FRAMED_DATA_RX_META_LEN = 4
+# TX_RESULT payload: [status u8][flags u8][seq u16 LE].
+FRAMED_DATA_TX_RESULT_PAYLOAD_LEN = 4
+# Sentinel for unavailable RSSI/SNR, in centi-units.
+FRAMED_DATA_SIGNAL_UNAVAILABLE = -32768
+
+# TX_RESULT status codes (daemon-defined).
+TX_RESULT_STATUS_OK = 0
+TX_RESULT_STATUS_INVALID_BAND = 1
+TX_RESULT_STATUS_INVALID_PACKET = 2
+TX_RESULT_STATUS_BUSY = 3
+TX_RESULT_STATUS_CAD_TIMEOUT = 4
+TX_RESULT_STATUS_RADIO_NOT_READY = 5
+TX_RESULT_STATUS_RADIO_ERROR = 6
+
+# TX_RESULT flag bits (informational; status is authoritative).
+TX_RESULT_FLAG_MANAGED = 0x01
+TX_RESULT_FLAG_DEFERRED = 0x02
+TX_RESULT_FLAG_CAD_TIMEOUT = 0x04
+
+# Daemon CADWAIT default (seconds) if the status reply does not report it.
+DEFAULT_CADWAIT_S = 1.5
 
 LORAHAM_PRESETS = {
     "eu_uk_long": {
@@ -76,8 +102,15 @@ class LoRaHAMInterface(Interface):
     LoRaHAM daemon socket interface.
 
     This interface uses persistent Unix stream connections to the LoRaHAM
-    daemon framed data and configuration sockets. RX_PACKET frames are forwarded
-    into MeshCore as raw packet payload bytes.
+    daemon framed data and configuration sockets. RX_PACKET frames are decoded
+    into ``(payload, rssi, snr)`` tuples and forwarded into MeshCore.
+
+    Channel access (LBT/CAD) is delegated to the daemon's MANAGED TX mode. Each
+    transmitted TX_PACKET is answered by exactly one TX_RESULT frame, which this
+    interface waits for instead of doing client-side CAD/busy polling.
+
+    Note: ``TXMODE`` and ``CADWAIT`` are global per-band daemon state. On a
+    radio band dedicated to this MeshCore node that is unproblematic.
     """
 
     def __init__(self, config: ConfigView):
@@ -105,9 +138,7 @@ class LoRaHAMInterface(Interface):
             "apply_config": True,
             "connect_timeout": 5.0,
             "reconnect_delay": 5.0,
-            "status_wait_timeout": 1.0,
-            "busy_wait_timeout": 5.0,
-            "tx_delay": 0.2,
+            "tx_result_margin": 1.0,
             "max_packet_size": 255,
             "airtime": 10,
         }
@@ -134,9 +165,7 @@ class LoRaHAMInterface(Interface):
         self.apply_config = config.get("apply_config", True)
         self.connect_timeout = config.get("connect_timeout", 5.0)
         self.reconnect_delay = config.get("reconnect_delay", 5.0)
-        self.status_wait_timeout = config.get("status_wait_timeout", 1.0)
-        self.busy_wait_timeout = config.get("busy_wait_timeout", 5.0)
-        self.tx_delay = config.get("tx_delay", 0.2)
+        self.tx_result_margin = config.get("tx_result_margin", 1.0)
         self.max_packet_size = config.get("max_packet_size", 255)
         self.airtime_dutycycle = config.get("airtime", 10)
 
@@ -149,12 +178,11 @@ class LoRaHAMInterface(Interface):
         self._config_writer = None
         self._running = False
         self._data_write_lock = asyncio.Lock()
-        self._status_condition = asyncio.Condition()
-        self._tx_seen = False
-        self._cad_seen = False
-        self._radio_status = None
-        self._tx_busy = False
-        self._cad_busy = False
+        # Daemon-reported CAD wait timeout, used to size the TX_RESULT timeout.
+        self._cadwait_s = DEFAULT_CADWAIT_S
+        # Exactly one TX is in flight at a time (the dispatcher serialises TX),
+        # so a single pending-result slot is enough; no seq map is needed.
+        self._pending_tx_result = None
 
         self._validate_config()
 
@@ -233,19 +261,20 @@ class LoRaHAMInterface(Interface):
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be boolean")
 
-        for name in ("connect_timeout", "reconnect_delay", "status_wait_timeout"):
+        for name in ("connect_timeout", "reconnect_delay"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"{name} must be numeric")
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
 
-        for name in ("busy_wait_timeout", "tx_delay"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"{name} must be numeric")
-            if value < 0:
-                raise ValueError(f"{name} must be zero or positive")
+        if (
+            isinstance(self.tx_result_margin, bool)
+            or not isinstance(self.tx_result_margin, (int, float))
+        ):
+            raise ValueError("tx_result_margin must be numeric")
+        if self.tx_result_margin < 0:
+            raise ValueError("tx_result_margin must be zero or positive")
 
         if (
             isinstance(self.airtime_dutycycle, bool)
@@ -291,7 +320,9 @@ class LoRaHAMInterface(Interface):
             raise ConnectionError(f"Unable to connect LoRaHAM {label} socket {path}: {exc}") from exc
 
     async def _connect_sockets(self):
-        await self._reset_status()
+        # Drop any TX result left pending from a previous connection.
+        self._fail_pending_tx()
+        self._cadwait_s = DEFAULT_CADWAIT_S
 
         self._data_reader, self._data_writer = await self._open_unix_connection(
             self.data_socket,
@@ -305,7 +336,12 @@ class LoRaHAMInterface(Interface):
         if self.apply_config:
             await self._send_config()
 
-        await self._request_status()
+        if self.enable_tx:
+            # Delegate LBT to the daemon and ask for a per-TX result frame.
+            await self._write_config_command("SET TXMODE=MANAGED\n")
+            await self._write_config_command("SET TXRESULT=1\n")
+
+        await self._handshake_status()
 
         logger.info("LoRaHAM daemon sockets connected")
 
@@ -322,19 +358,6 @@ class LoRaHAMInterface(Interface):
         logger.info("Applying LoRaHAM radio config: %s", command.strip())
         await self._write_config_command(command)
 
-    async def _request_status(self):
-        logger.debug("Requesting LoRaHAM daemon status")
-        await self._write_config_command("GET STATUS\n")
-
-    async def _reset_status(self):
-        async with self._status_condition:
-            self._tx_seen = False
-            self._cad_seen = False
-            self._radio_status = None
-            self._tx_busy = False
-            self._cad_busy = False
-            self._status_condition.notify_all()
-
     @staticmethod
     def _parse_key_value_fields(line):
         return {
@@ -342,43 +365,71 @@ class LoRaHAMInterface(Interface):
             for key, value in re.findall(r"\b([A-Z]+)=([^\s]+)", line.upper())
         }
 
-    def _parse_conf_line(self, line):
-        fields = self._parse_key_value_fields(line)
-        if not fields:
-            return None
-
-        status = {}
-        if "RADIO" in fields:
-            status["radio"] = fields["RADIO"]
-        if "TX" in fields and fields["TX"] in ("0", "1"):
-            status["tx"] = fields["TX"] == "1"
-        if "CAD" in fields and fields["CAD"] in ("0", "1"):
-            status["cad"] = fields["CAD"] == "1"
-
-        return status or None
-
-    async def _update_status_from_line(self, line):
-        status = self._parse_conf_line(line)
-        if status is None:
+    async def _handshake_status(self):
+        """
+        One-shot connect handshake: request `GET STATUS` and read the reply to
+        cache the daemon CADWAIT value. This is not ongoing polling; the ongoing
+        config reader only drains/logs after this returns.
+        """
+        try:
+            await self._write_config_command("GET STATUS\n")
+        except Exception as exc:
+            logger.warning("Unable to request LoRaHAM status: %s", exc)
             return
 
-        async with self._status_condition:
-            if "radio" in status:
-                self._radio_status = status["radio"]
-            if "tx" in status:
-                self._tx_busy = status["tx"]
-                self._tx_seen = True
-            if "cad" in status:
-                self._cad_busy = status["cad"]
-                self._cad_seen = True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.connect_timeout
+        buffer = bytearray()
 
-            self._status_condition.notify_all()
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning(
+                    "No LoRaHAM CADWAIT in status; using default %.2f s",
+                    self._cadwait_s,
+                )
+                return
 
-    def _status_seen(self):
-        return self._tx_seen and self._cad_seen
+            try:
+                data = await asyncio.wait_for(
+                    self._config_reader.read(256),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "No LoRaHAM status reply; using default CADWAIT %.2f s",
+                    self._cadwait_s,
+                )
+                return
 
-    def _radio_busy(self):
-        return self._tx_busy or self._cad_busy
+            if not data:
+                raise ConnectionError(
+                    "LoRaHAM config socket closed during status handshake"
+                )
+
+            buffer.extend(data)
+            while b"\n" in buffer:
+                line, _, rest = buffer.partition(b"\n")
+                buffer = bytearray(rest)
+                decoded_line = line.decode(errors="replace").rstrip("\r")
+                logger.debug("LoRaHAM config socket: %s", decoded_line)
+
+                fields = self._parse_key_value_fields(decoded_line)
+                if "RADIO" in fields:
+                    logger.debug("LoRaHAM radio status: %s", fields["RADIO"])
+                if "CADWAIT" in fields:
+                    try:
+                        self._cadwait_s = max(
+                            int(fields["CADWAIT"]) / 1000.0, 0.0
+                        )
+                        logger.info(
+                            "LoRaHAM CADWAIT=%s ms", fields["CADWAIT"]
+                        )
+                    except ValueError:
+                        logger.warning(
+                            "Bad LoRaHAM CADWAIT value: %s", fields["CADWAIT"]
+                        )
+                    return
 
     def _calculate_airtime_ms(self, payload_len):
         """
@@ -407,93 +458,6 @@ class LoRaHAMInterface(Interface):
         airtime = (self.preamble + 4.25 + payload_symbols) * symbol_time
         return airtime * 1000
 
-    async def _ensure_status(self):
-        if self._status_seen():
-            return True
-
-        try:
-            await self._request_status()
-        except Exception as exc:
-            logger.warning("Unable to request LoRaHAM status: %s", exc)
-            return False
-
-        try:
-            async with self._status_condition:
-                await asyncio.wait_for(
-                    self._status_condition.wait_for(self._status_seen),
-                    timeout=self.status_wait_timeout,
-                )
-            return True
-        except TimeoutError:
-            logger.warning(
-                "LoRaHAM status unavailable after %.2f seconds; packet not sent",
-                self.status_wait_timeout,
-            )
-            return False
-
-    async def _wait_until_not_busy(self, timeout):
-        async with self._status_condition:
-            if not self._radio_busy():
-                return True
-
-            try:
-                await asyncio.wait_for(
-                    self._status_condition.wait_for(lambda: not self._radio_busy()),
-                    timeout=timeout,
-                )
-                return True
-            except TimeoutError:
-                return False
-
-    async def _wait_for_tx_window(self):
-        if not await self._ensure_status():
-            return False
-
-        if not self._radio_busy():
-            return True
-
-        try:
-            await self._request_status()
-        except Exception as exc:
-            logger.warning("Unable to refresh LoRaHAM busy status: %s", exc)
-
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.busy_wait_timeout
-
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                if self._tx_busy:
-                    logger.warning(
-                        "LoRaHAM TX busy after %.2f seconds; packet not sent",
-                        self.busy_wait_timeout,
-                    )
-                    return False
-
-                # Failsafe: a stuck CAD flag must not block TX forever.
-                # Persistent real channel activity should normally clear within
-                # busy_wait_timeout.
-                if self._cad_busy:
-                    logger.warning(
-                        "LoRaHAM CAD busy after %.2f seconds; sending anyway",
-                        self.busy_wait_timeout,
-                    )
-                    return True
-
-                return True
-
-            if not await self._wait_until_not_busy(remaining):
-                continue
-
-            if self.tx_delay > 0:
-                delay = min(self.tx_delay, max(deadline - loop.time(), 0))
-                if delay > 0:
-                    await asyncio.sleep(delay)
-
-            async with self._status_condition:
-                if not self._radio_busy():
-                    return True
-
     async def _config_reader_loop(self):
         buffer = bytearray()
 
@@ -509,7 +473,6 @@ class LoRaHAMInterface(Interface):
                 buffer = bytearray(rest)
                 decoded_line = line.decode(errors="replace").rstrip("\r")
                 logger.debug("LoRaHAM config socket: %s", decoded_line)
-                await self._update_status_from_line(decoded_line)
 
             if len(buffer) > 4096:
                 logger.warning("Discarding oversized LoRaHAM config socket buffer")
@@ -542,16 +505,46 @@ class LoRaHAMInterface(Interface):
         if payload_len == 0:
             return frame_type, b""
 
-        if (
-            frame_type in (FRAMED_DATA_TYPE_RX_PACKET, FRAMED_DATA_TYPE_TX_PACKET)
-            and payload_len > self.max_packet_size
-        ):
-            await self._read_exact(reader, payload_len, label)
-            logger.warning("Dropping oversized LoRaHAM frame: %s bytes", payload_len)
-            return None, b""
+        # Oversize guard. RX_PACKET carries 4 metadata bytes before the RF
+        # payload, so compare the RF length (not the whole payload) against the
+        # configured limit.
+        if frame_type == FRAMED_DATA_TYPE_RX_PACKET:
+            if payload_len > FRAMED_DATA_RX_META_LEN + self.max_packet_size:
+                await self._read_exact(reader, payload_len, label)
+                logger.warning(
+                    "Dropping oversized LoRaHAM RX frame: %s bytes", payload_len
+                )
+                return None, b""
+        elif frame_type == FRAMED_DATA_TYPE_TX_PACKET:
+            if payload_len > self.max_packet_size:
+                await self._read_exact(reader, payload_len, label)
+                logger.warning(
+                    "Dropping oversized LoRaHAM frame: %s bytes", payload_len
+                )
+                return None, b""
 
         payload = await self._read_exact(reader, payload_len, label)
         return frame_type, payload
+
+    def _handle_rx_packet(self, payload):
+        if len(payload) < FRAMED_DATA_RX_META_LEN:
+            logger.warning(
+                "Ignoring short LoRaHAM RX frame: %s bytes", len(payload)
+            )
+            return None
+
+        rssi_cdbm = int.from_bytes(payload[0:2], "little", signed=True)
+        snr_cdb = int.from_bytes(payload[2:4], "little", signed=True)
+        rf = payload[FRAMED_DATA_RX_META_LEN:]
+
+        if not rf:
+            logger.warning("Ignoring empty LoRaHAM RX packet frame")
+            return None
+
+        rssi = 0.0 if rssi_cdbm == FRAMED_DATA_SIGNAL_UNAVAILABLE else rssi_cdbm / 100.0
+        snr = 0.0 if snr_cdb == FRAMED_DATA_SIGNAL_UNAVAILABLE else snr_cdb / 100.0
+
+        return bytes(rf), rssi, snr
 
     async def _data_reader_loop(self):
         while True:
@@ -561,16 +554,23 @@ class LoRaHAMInterface(Interface):
                 continue
 
             if frame_type == FRAMED_DATA_TYPE_RX_PACKET:
-                if not payload:
-                    logger.warning("Ignoring empty LoRaHAM RX packet frame")
+                decoded = self._handle_rx_packet(payload)
+                if decoded is None:
                     continue
 
-                await self.rx_q.put(bytearray(payload))
+                rf, rssi, snr = decoded
+                await self.rx_q.put((rf, rssi, snr))
                 logger.debug(
-                    "Queued LoRaHAM RX packet, %s bytes, rx_q=%s",
-                    len(payload),
+                    "Queued LoRaHAM RX packet, %s bytes, rssi=%.2f snr=%.2f, rx_q=%s",
+                    len(rf),
+                    rssi,
+                    snr,
                     self.rx_q.qsize(),
                 )
+                continue
+
+            if frame_type == FRAMED_DATA_TYPE_TX_RESULT:
+                self._deliver_tx_result(payload)
                 continue
 
             if frame_type == FRAMED_DATA_TYPE_ERROR:
@@ -578,11 +578,56 @@ class LoRaHAMInterface(Interface):
                     "LoRaHAM framed data error: %s",
                     payload.decode("utf-8", errors="replace"),
                 )
+                # A daemon ERROR can arrive instead of a TX_RESULT; do not leave
+                # an in-flight transmit waiting.
+                self._fail_pending_tx()
                 continue
 
-            raise ConnectionError(
-                f"Unexpected LoRaHAM data frame type 0x{frame_type:02X}"
+            # TX_PACKET (0x02) or anything else from the daemon is unexpected;
+            # log and keep the connection rather than tearing it down.
+            logger.warning(
+                "Ignoring unexpected LoRaHAM data frame type 0x%02X", frame_type
             )
+
+    def _deliver_tx_result(self, payload):
+        if len(payload) < FRAMED_DATA_TX_RESULT_PAYLOAD_LEN:
+            logger.warning(
+                "Ignoring short LoRaHAM TX_RESULT frame: %s bytes", len(payload)
+            )
+            return
+
+        status = payload[0]
+        flags = payload[1]
+        seq = payload[2] | (payload[3] << 8)
+
+        future = self._pending_tx_result
+        if future is None or future.done():
+            logger.warning(
+                "Discarding unexpected LoRaHAM TX_RESULT (status=%s flags=0x%02X seq=%s)",
+                status,
+                flags,
+                seq,
+            )
+            return
+
+        self._pending_tx_result = None
+        future.set_result((status, flags, seq))
+
+    def _fail_pending_tx(self):
+        future = self._pending_tx_result
+        self._pending_tx_result = None
+        if future is not None and not future.done():
+            future.set_result(None)
+
+    def _request_reconnect(self):
+        # Closing the data writer drops the transport, which makes the reader
+        # loops error out so _connection_loop reconnects.
+        writer = self._data_writer
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception as exc:
+                logger.debug("Error while forcing LoRaHAM reconnect: %s", exc)
 
     async def _connection_loop(self):
         while self._running:
@@ -629,6 +674,9 @@ class LoRaHAMInterface(Interface):
                 await asyncio.sleep(self.reconnect_delay)
 
     async def _close_sockets(self):
+        # Resolve any in-flight transmit so it does not hang across reconnect.
+        self._fail_pending_tx()
+
         writers = (self._data_writer, self._config_writer)
 
         self._data_reader = None
@@ -681,31 +729,76 @@ class LoRaHAMInterface(Interface):
 
     async def transmit(self, tx_packet):
         """
-        Transmit one MeshCore packet as one LoRaHAM TX_PACKET frame.
+        Transmit one MeshCore packet as one LoRaHAM TX_PACKET frame and wait for
+        the daemon's TX_RESULT. Returns the LoRa airtime in milliseconds on a
+        successful send, or 0 if the packet was not sent.
         """
         if not self.enable_tx:
             logger.debug("LoRaHAM daemon TX disabled; packet discarded")
             return 0
 
-        if not await self._wait_for_tx_window():
+        if self._data_writer is None:
+            logger.warning("LoRaHAM data socket not connected; packet not sent")
             return 0
+
+        airtime_ms = self._calculate_airtime_ms(len(tx_packet))
+        timeout = self._cadwait_s + (airtime_ms / 1000.0) + self.tx_result_margin
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        # Arm the pending slot before writing so a fast TX_RESULT is not missed.
+        self._pending_tx_result = future
 
         try:
             await self._write_frame(FRAMED_DATA_TYPE_TX_PACKET, tx_packet)
         except Exception as exc:
+            if self._pending_tx_result is future:
+                self._pending_tx_result = None
             logger.error("LoRaHAM daemon TX failed: %s", exc)
             return 0
 
-        airtime_ms = self._calculate_airtime_ms(len(tx_packet))
-        self.airtime_txtimestamp.append(time.time())
-        self.airtime_txtime.append(airtime_ms)
+        try:
+            result = await asyncio.wait_for(future, timeout=timeout)
+        except TimeoutError:
+            if self._pending_tx_result is future:
+                self._pending_tx_result = None
+            logger.warning(
+                "No LoRaHAM TX_RESULT after %.2f s; packet result lost, reconnecting",
+                timeout,
+            )
+            self._request_reconnect()
+            return 0
 
+        if result is None:
+            # Resolved by an ERROR frame or a connection drop.
+            logger.warning("LoRaHAM TX aborted before a result was received")
+            return 0
+
+        status, flags, seq = result
         logger.debug(
-            "Queued LoRaHAM TX packet, %s bytes, airtime %.2f ms",
-            len(tx_packet),
-            airtime_ms,
+            "LoRaHAM TX_RESULT status=%s flags=0x%02X seq=%s", status, flags, seq
         )
-        return airtime_ms
+
+        if status == TX_RESULT_STATUS_OK:
+            self.airtime_txtimestamp.append(time.time())
+            self.airtime_txtime.append(airtime_ms)
+            logger.debug(
+                "Sent LoRaHAM TX packet, %s bytes, airtime %.2f ms",
+                len(tx_packet),
+                airtime_ms,
+            )
+            return airtime_ms
+
+        if status in (TX_RESULT_STATUS_BUSY, TX_RESULT_STATUS_CAD_TIMEOUT):
+            # Channel was busy; the daemon did not transmit. MeshCore decides on
+            # retransmission, so do not count airtime.
+            logger.info(
+                "LoRaHAM channel busy (status=%s); packet not sent", status
+            )
+            return 0
+
+        logger.error("LoRaHAM TX failed (status=%s seq=%s)", status, seq)
+        return 0
 
     def transmit_wait(self):
         """
