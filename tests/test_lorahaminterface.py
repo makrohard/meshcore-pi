@@ -343,7 +343,10 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
         daemon = await self.make_daemon(respond_to_tx=False)
         iface = await self.connect_interface(daemon)
 
-        real_writer = iface._data_writer
+        # Keep a live reference to the real writer: replacing iface._data_writer
+        # below orphans it, and a GC'd StreamWriter closes its transport (which
+        # the reader shares) -> the reader would EOF before the late TX_RESULT.
+        real_writer = iface._data_writer  # noqa: F841 (intentional keepalive)
 
         class _DrainFailsWriter:
             def __init__(self):
@@ -370,10 +373,20 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(iface._pending_tx_result)
         self.assertTrue(stub.is_closing())  # reconnect forced
 
-        # A late TX_RESULT on the real socket must be discarded (no pending) and
-        # a follow-up transmit stays inhibited (closing writer + not ready).
-        real_writer.write(daemon._frame(0x04, bytes([0, 1, 1, 0])))
-        await real_writer.drain()
+        # A late TX_RESULT now arrives daemon -> client over the real data socket
+        # and reaches _data_reader_loop() with no pending future, so it must be
+        # discarded (not applied to any later transmit).
+        with self.assertLogs("interfaces.lorahaminterface", level="WARNING") as cm:
+            await daemon.send_tx_result(status=0, flags=1, seq=1)
+            await asyncio.sleep(0.05)  # let the reader consume + discard it
+        self.assertTrue(
+            any("Discarding unexpected" in line for line in cm.output),
+            cm.output,
+        )
+        self.assertIsNone(iface._pending_tx_result)
+
+        # Follow-up transmit stays inhibited (closing writer + not ready) and
+        # arms no new future for the late result to fulfil.
         result2 = await asyncio.wait_for(iface.transmit(b"again"), timeout=1.0)
         self.assertEqual(result2, 0)
         self.assertIsNone(iface._pending_tx_result)

@@ -167,6 +167,20 @@ class FakeLoRaHAMDaemon:
         self.data_writer.write(frame)
         await self.data_writer.drain()
 
+    async def send_tx_result(self, *, status=0, flags=0, seq=0):
+        # Server-side unsolicited TX_RESULT (e.g. a late result), delivered
+        # daemon -> client so it reaches the client's _data_reader_loop().
+        if self.data_writer is None:
+            return
+        payload = bytes([
+            status & 0xFF,
+            flags & 0xFF,
+            seq & 0xFF,
+            (seq >> 8) & 0xFF,
+        ])
+        self.data_writer.write(self._frame(FRAMED_DATA_TYPE_TX_RESULT, payload))
+        await self.data_writer.drain()
+
     async def wait_tx(self, payload, timeout=1.0):
         async with self._tx_condition:
             await asyncio.wait_for(
