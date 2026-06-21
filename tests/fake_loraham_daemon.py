@@ -8,7 +8,18 @@ FRAMED_DATA_TYPE_TX_RESULT = 0x04
 
 FRAMED_DATA_SIGNAL_UNAVAILABLE = -32768
 
+# Wire status values (loraham_daemon framed_data.h, v111).
 TX_RESULT_STATUS_OK = 0
+TX_RESULT_STATUS_BUSY = 1
+TX_RESULT_STATUS_CHANNEL_BUSY = 2
+TX_RESULT_STATUS_RADIO_NOT_READY = 3
+TX_RESULT_STATUS_RADIO_ERROR = 4
+TX_RESULT_STATUS_INVALID_PACKET = 5
+TX_RESULT_STATUS_INVALID_BAND = 6
+
+TX_RESULT_FLAG_MANAGED = 0x01
+TX_RESULT_FLAG_DEFERRED = 0x02
+TX_RESULT_FLAG_CAD_TIMEOUT = 0x04
 
 
 class FakeLoRaHAMDaemon:
@@ -22,6 +33,7 @@ class FakeLoRaHAMDaemon:
         respond_to_tx=True,
         tx_result_status=TX_RESULT_STATUS_OK,
         tx_result_flags=0x01,
+        tx_result_payload_len=4,
         cadwait_ms=1500,
     ):
         self.root = Path(root)
@@ -36,9 +48,12 @@ class FakeLoRaHAMDaemon:
         self.respond_to_tx = respond_to_tx
         self.tx_result_status = tx_result_status
         self.tx_result_flags = tx_result_flags
+        # On-the-wire TX_RESULT payload length; not 4 = malformed (for tests).
+        self.tx_result_payload_len = tx_result_payload_len
         self._tx_result_seq = 0
 
-        # Reported in the GET STATUS reply.
+        # Reported in the GET STATUS reply. None omits CADWAIT entirely; a
+        # non-numeric value yields a malformed CADWAIT field (for tests).
         self.cadwait_ms = cadwait_ms
 
         self.data_server = None
@@ -91,10 +106,13 @@ class FakeLoRaHAMDaemon:
                 pass
 
     def _status_line(self):
+        cadwait = ""
+        if self.cadwait_ms is not None:
+            cadwait = f"CADWAIT={self.cadwait_ms} "
         return (
             f"STATUS RADIO=READY TX={1 if self.tx else 0} "
             f"CAD={1 if self.cad else 0} GETRSSI=0 TXRESULT=1 TXQUEUE=1 "
-            f"CADWAIT={self.cadwait_ms} CADIDLE=250 CADPOLL=50 "
+            f"{cadwait}CADIDLE=250 CADPOLL=50 "
             f"CADTXAFTERTIMEOUT=0\n"
         )
 
@@ -112,13 +130,16 @@ class FakeLoRaHAMDaemon:
             self.cad = cad
             await self._send_config_line(f"CAD={1 if cad else 0}\n")
 
-    def set_tx_result(self, *, status=None, flags=None, respond=None):
+    def set_tx_result(self, *, status=None, flags=None, respond=None,
+                      payload_len=None):
         if status is not None:
             self.tx_result_status = status
         if flags is not None:
             self.tx_result_flags = flags
         if respond is not None:
             self.respond_to_tx = respond
+        if payload_len is not None:
+            self.tx_result_payload_len = payload_len
 
     async def send_rx(self, payload, *, rssi_cdbm=-9000, snr_cdb=550):
         if self.data_writer is None:
@@ -161,6 +182,12 @@ class FakeLoRaHAMDaemon:
             self._tx_result_seq & 0xff,
             (self._tx_result_seq >> 8) & 0xff,
         ])
+        # Truncate or zero-pad to the configured length to emit malformed frames.
+        n = self.tx_result_payload_len
+        if n < len(payload):
+            payload = payload[:n]
+        elif n > len(payload):
+            payload = payload + bytes(n - len(payload))
         self.data_writer.write(self._frame(FRAMED_DATA_TYPE_TX_RESULT, payload))
         await self.data_writer.drain()
 

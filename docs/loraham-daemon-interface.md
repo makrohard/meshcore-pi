@@ -100,20 +100,44 @@ TX is **managed by the daemon**: the interface writes one `TX_PACKET` frame and
 waits for the corresponding `TX_RESULT` frame. There is no client-side CAD/busy
 polling.
 
+The `TX_RESULT` payload is exactly 4 bytes: `[status u8][flags u8][seq u16 LE]`.
+The wire status values (loraham_daemon `framed_data.h`) are:
+
+```text
+0 OK
+1 BUSY
+2 CHANNEL_BUSY
+3 RADIO_NOT_READY
+4 RADIO_ERROR
+5 INVALID_PACKET
+6 INVALID_BAND
+```
+
+There is **no** CAD-timeout status. CAD-timeout context is flag bit `0x04`:
+a not-sent MANAGED TX reports `CHANNEL_BUSY (2)`; a send-after-timeout reports
+`OK (0)` with the `0x04` flag set (i.e. it was transmitted). Flags:
+`MANAGED=0x01`, `DEFERRED=0x02`, `CAD_TIMEOUT=0x04` (informational; status is
+authoritative).
+
 ```text
 write TX_PACKET
 wait for TX_RESULT, timeout = CADWAIT + airtime(packet) + tx_result_margin
 
-status OK          -> count airtime, return airtime (ms)
-status BUSY/CAD    -> not sent, return 0, no duty-cycle entry (MeshCore retries)
-status RADIO_*/... -> log error, return 0
-ERROR frame        -> in-flight TX resolved as failed, return 0
-timeout            -> log warning, return 0, force reconnect (result lost)
+OK (0)                       -> count airtime, return airtime (ms)
+                                (also for OK + CAD_TIMEOUT flag = sent after wait)
+BUSY (1) / CHANNEL_BUSY (2)  -> not sent, return 0, no duty-cycle entry
+RADIO_NOT_READY (3) / RADIO_ERROR (4) -> log error, return 0
+INVALID_PACKET (5) / INVALID_BAND (6) -> log error, return 0
+ERROR frame                  -> in-flight TX resolved as failed, return 0
+timeout / malformed result   -> log warning, return 0, force reconnect
 ```
 
-The daemon delivers exactly one final `TX_RESULT` per `TX_PACKET`. Because the
-dispatcher serialises TX, only one result is outstanding at a time; the `seq`
-field is logged as a sanity check.
+The daemon delivers exactly one final `TX_RESULT` per `TX_PACKET`. The whole TX
+transaction (arm pending result -> write -> await -> consume) is serialised, so
+at most one result is outstanding at a time; the `seq` field is logged as a
+sanity check. A TX_RESULT whose payload is not exactly 4 bytes is treated as
+malformed and ignored. When TX is enabled, the interface only transmits once a
+valid `CADWAIT` has been read from the connect handshake (no silent default).
 
 Packet length is validated before writing a `TX_PACKET` frame. `transmit()`
 returns the calculated LoRa airtime in milliseconds (on success) for dispatcher
@@ -135,10 +159,14 @@ Covered behavior:
 
 ```text
 connect sends SET TXMODE=MANAGED + SET TXRESULT=1 and reads CADWAIT
-RX_PACKET decoded to (payload, rssi, snr), including the unavailable sentinel
+RX_PACKET decoded to (payload, rssi, snr), incl. sentinel and max (255 RF) frame
 oversized RX frame dropped without reconnect
-TX OK records airtime; BUSY/CAD_TIMEOUT/RADIO_ERROR return 0 with no airtime
-TX_RESULT timeout returns 0 and forces a reconnect
+TX result by raw wire status: OK(0) counts airtime (also OK+0x04 flag);
+  BUSY(1)/CHANNEL_BUSY(2) -> 0; RADIO_NOT_READY(3)/RADIO_ERROR(4) -> 0;
+  INVALID_PACKET(5)/INVALID_BAND(6) -> 0; unknown -> 0
+concurrent transmit() calls serialise (one pending result at a time)
+TX inhibited until a valid CADWAIT is known (enable_tx)
+malformed TX_RESULT (not 4 bytes) ignored; timeout returns 0 + reconnect
 ERROR frame resolves an in-flight TX as failed
 reconnect after daemon restart
 ```

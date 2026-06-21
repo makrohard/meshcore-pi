@@ -4,15 +4,20 @@ import time
 import unittest
 
 from configuration import get_config
-from interfaces.lorahaminterface import (
-    LoRaHAMInterface,
-    TX_RESULT_STATUS_OK,
-    TX_RESULT_STATUS_BUSY,
-    TX_RESULT_STATUS_CAD_TIMEOUT,
-    TX_RESULT_STATUS_RADIO_ERROR,
-)
+from interfaces.lorahaminterface import LoRaHAMInterface
 
 from tests.fake_loraham_daemon import FakeLoRaHAMDaemon
+
+# Raw on-the-wire TX_RESULT status values (loraham_daemon framed_data.h v111).
+# Defined here as literals so the assertions do not depend on the client enum.
+WIRE_OK = 0
+WIRE_BUSY = 1
+WIRE_CHANNEL_BUSY = 2
+WIRE_RADIO_NOT_READY = 3
+WIRE_RADIO_ERROR = 4
+WIRE_INVALID_PACKET = 5
+WIRE_INVALID_BAND = 6
+WIRE_FLAG_CAD_TIMEOUT = 0x04
 
 
 class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
@@ -163,54 +168,69 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
 
     # --- TX path (managed, via TX_RESULT) -----------------------------------
 
-    async def test_transmit_ok_records_airtime(self):
-        daemon = await self.make_daemon(tx_result_status=TX_RESULT_STATUS_OK)
+    async def _transmit_with_wire_status(self, status, flags=0x00, payload=b"x"):
+        daemon = await self.make_daemon(tx_result_status=status, tx_result_flags=flags)
         iface = await self.connect_interface(daemon)
+        result = await asyncio.wait_for(iface.transmit(payload), timeout=1.0)
+        return iface, result
 
-        airtime_ms = await asyncio.wait_for(iface.transmit(b"ok"), timeout=1.0)
-        await daemon.wait_tx(b"ok")
+    async def test_transmit_ok_records_airtime(self):
+        # Wire status 0 = OK.
+        iface, airtime_ms = await self._transmit_with_wire_status(WIRE_OK)
 
         self.assertGreater(airtime_ms, 0)
         self.assertEqual(iface.airtime_txtime[-1], airtime_ms)
         self.assertGreater(iface.airtime_txtimestamp[-1], 0)
 
+    async def test_transmit_ok_with_cad_timeout_flag_counts_as_sent(self):
+        # Wire status 0 + flag 0x04 = send-after-CAD-timeout = transmitted.
+        iface, airtime_ms = await self._transmit_with_wire_status(
+            WIRE_OK, flags=0x01 | WIRE_FLAG_CAD_TIMEOUT)
+
+        self.assertGreater(airtime_ms, 0)
+        self.assertEqual(iface.airtime_txtime[-1], airtime_ms)
+
     async def test_transmit_busy_not_sent_and_no_dutycycle(self):
-        daemon = await self.make_daemon(tx_result_status=TX_RESULT_STATUS_BUSY)
-        iface = await self.connect_interface(daemon)
-
-        before_time = list(iface.airtime_txtime)
-        before_stamp = list(iface.airtime_txtimestamp)
-
-        result = await asyncio.wait_for(iface.transmit(b"busy"), timeout=1.0)
-
+        # Wire status 1 = BUSY.
+        iface, result = await self._transmit_with_wire_status(WIRE_BUSY)
         self.assertEqual(result, 0)
-        self.assertEqual(list(iface.airtime_txtime), before_time)
-        self.assertEqual(list(iface.airtime_txtimestamp), before_stamp)
+        self.assertEqual(list(iface.airtime_txtime), [0, 0, 0, 0, 0])
 
-    async def test_transmit_cad_timeout_not_sent(self):
-        daemon = await self.make_daemon(
-            tx_result_status=TX_RESULT_STATUS_CAD_TIMEOUT,
-            tx_result_flags=0x05,
-        )
-        iface = await self.connect_interface(daemon)
-
-        before_time = list(iface.airtime_txtime)
-
-        result = await asyncio.wait_for(iface.transmit(b"cad"), timeout=1.0)
-
+    async def test_transmit_channel_busy_not_sent_and_no_dutycycle(self):
+        # Wire status 2 = CHANNEL_BUSY (this was mis-decoded before the fix).
+        iface, result = await self._transmit_with_wire_status(WIRE_CHANNEL_BUSY)
         self.assertEqual(result, 0)
-        self.assertEqual(list(iface.airtime_txtime), before_time)
+        self.assertEqual(list(iface.airtime_txtime), [0, 0, 0, 0, 0])
+
+    async def test_transmit_radio_not_ready_returns_zero(self):
+        # Wire status 3 = RADIO_NOT_READY.
+        iface, result = await self._transmit_with_wire_status(WIRE_RADIO_NOT_READY)
+        self.assertEqual(result, 0)
+        self.assertEqual(list(iface.airtime_txtime), [0, 0, 0, 0, 0])
 
     async def test_transmit_radio_error_returns_zero(self):
-        daemon = await self.make_daemon(tx_result_status=TX_RESULT_STATUS_RADIO_ERROR)
-        iface = await self.connect_interface(daemon)
-
-        before_time = list(iface.airtime_txtime)
-
-        result = await asyncio.wait_for(iface.transmit(b"err"), timeout=1.0)
-
+        # Wire status 4 = RADIO_ERROR (NOT "channel busy").
+        iface, result = await self._transmit_with_wire_status(WIRE_RADIO_ERROR)
         self.assertEqual(result, 0)
-        self.assertEqual(list(iface.airtime_txtime), before_time)
+        self.assertEqual(list(iface.airtime_txtime), [0, 0, 0, 0, 0])
+
+    async def test_transmit_invalid_packet_returns_zero(self):
+        # Wire status 5 = INVALID_PACKET.
+        iface, result = await self._transmit_with_wire_status(WIRE_INVALID_PACKET)
+        self.assertEqual(result, 0)
+        self.assertEqual(list(iface.airtime_txtime), [0, 0, 0, 0, 0])
+
+    async def test_transmit_invalid_band_returns_zero(self):
+        # Wire status 6 = INVALID_BAND.
+        iface, result = await self._transmit_with_wire_status(WIRE_INVALID_BAND)
+        self.assertEqual(result, 0)
+        self.assertEqual(list(iface.airtime_txtime), [0, 0, 0, 0, 0])
+
+    async def test_transmit_unknown_status_returns_zero(self):
+        # Unknown wire status (7) must not be treated as success.
+        iface, result = await self._transmit_with_wire_status(7)
+        self.assertEqual(result, 0)
+        self.assertEqual(list(iface.airtime_txtime), [0, 0, 0, 0, 0])
 
     async def test_transmit_error_frame_aborts_pending(self):
         daemon = await self.make_daemon(respond_to_tx=False)
@@ -241,6 +261,68 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, 0)
         self.assertTrue(writer.is_closing())
+
+    # --- P2a concurrency ----------------------------------------------------
+
+    async def test_concurrent_transmits_serialise(self):
+        # Two overlapping transmit() calls must both get their correct result
+        # with no orphaned/overwritten pending future.
+        daemon = await self.make_daemon(tx_result_status=WIRE_OK)
+        iface = await self.connect_interface(daemon)
+
+        results = await asyncio.gather(
+            iface.transmit(b"a"),
+            iface.transmit(b"b"),
+        )
+
+        self.assertTrue(all(r > 0 for r in results))
+        self.assertIn(b"a", daemon.tx_packets)
+        self.assertIn(b"b", daemon.tx_packets)
+        # Two successful sends -> two airtime entries, none orphaned.
+        self.assertEqual(sum(1 for t in iface.airtime_txtime if t > 0), 2)
+        self.assertIsNone(iface._pending_tx_result)
+
+    # --- P2b CADWAIT inhibit ------------------------------------------------
+
+    async def test_tx_inhibited_without_valid_cadwait(self):
+        # Status reply omits CADWAIT -> _cadwait_valid stays False -> TX must not
+        # be sent with the silent default timeout (RX keeps working).
+        daemon = await self.make_daemon(cadwait_ms=None)
+        iface = await self.connect_interface(daemon, connect_timeout=0.2)
+
+        self.assertFalse(iface._cadwait_valid)
+        result = await asyncio.wait_for(iface.transmit(b"nope"), timeout=1.0)
+        self.assertEqual(result, 0)
+        self.assertNotIn(b"nope", daemon.tx_packets)
+
+        # RX still works without a valid CADWAIT.
+        await daemon.send_rx(b"rx")
+        rf, _r, _s = await asyncio.wait_for(iface.rx_q.get(), timeout=1.0)
+        self.assertEqual(rf, b"rx")
+
+    # --- P3 length validation ----------------------------------------------
+
+    async def test_malformed_tx_result_length_is_ignored(self):
+        for bad_len in (3, 5):
+            daemon = await self.make_daemon(
+                tx_result_status=WIRE_OK, tx_result_payload_len=bad_len, cadwait_ms=10)
+            iface = await self.connect_interface(
+                daemon, sf=7, bw=500000, tx_result_margin=0.05)
+
+            # Malformed TX_RESULT is ignored -> no result -> timeout -> 0.
+            result = await asyncio.wait_for(iface.transmit(b"m"), timeout=2.0)
+            self.assertEqual(result, 0, f"len={bad_len}")
+            self.assertEqual(list(iface.airtime_txtime), [0, 0, 0, 0, 0])
+
+    async def test_max_rx_frame_delivered(self):
+        daemon = await self.make_daemon()
+        iface = await self.connect_interface(daemon)
+
+        payload = bytes([0xAB]) * 255  # 4 meta + 255 RF = max frame
+        await daemon.send_rx(payload)
+        rf, _r, _s = await asyncio.wait_for(iface.rx_q.get(), timeout=1.0)
+        self.assertEqual(len(rf), 255)
+        self.assertEqual(rf, payload)
 
     # --- Duty cycle ---------------------------------------------------------
 

@@ -46,14 +46,17 @@ FRAMED_DATA_TX_RESULT_PAYLOAD_LEN = 4
 # Sentinel for unavailable RSSI/SNR, in centi-units.
 FRAMED_DATA_SIGNAL_UNAVAILABLE = -32768
 
-# TX_RESULT status codes (daemon-defined).
+# TX_RESULT wire status codes (loraham_daemon framed_data.h, v111). These are
+# the on-the-wire values in the TX_RESULT payload, NOT the daemon's internal
+# TxResult enum. There is no CAD_TIMEOUT status: a not-sent MANAGED TX reports
+# CHANNEL_BUSY (2); a send-after-timeout reports OK (0) with the CAD_TIMEOUT flag.
 TX_RESULT_STATUS_OK = 0
-TX_RESULT_STATUS_INVALID_BAND = 1
-TX_RESULT_STATUS_INVALID_PACKET = 2
-TX_RESULT_STATUS_BUSY = 3
-TX_RESULT_STATUS_CAD_TIMEOUT = 4
-TX_RESULT_STATUS_RADIO_NOT_READY = 5
-TX_RESULT_STATUS_RADIO_ERROR = 6
+TX_RESULT_STATUS_BUSY = 1
+TX_RESULT_STATUS_CHANNEL_BUSY = 2
+TX_RESULT_STATUS_RADIO_NOT_READY = 3
+TX_RESULT_STATUS_RADIO_ERROR = 4
+TX_RESULT_STATUS_INVALID_PACKET = 5
+TX_RESULT_STATUS_INVALID_BAND = 6
 
 # TX_RESULT flag bits (informational; status is authoritative).
 TX_RESULT_FLAG_MANAGED = 0x01
@@ -178,8 +181,16 @@ class LoRaHAMInterface(Interface):
         self._config_writer = None
         self._running = False
         self._data_write_lock = asyncio.Lock()
+        # Serialises the whole TX transaction (arm pending -> write -> await ->
+        # consume) so at most one _pending_tx_result exists at any time, even if
+        # two transmit() calls overlap.
+        self._tx_lock = asyncio.Lock()
         # Daemon-reported CAD wait timeout, used to size the TX_RESULT timeout.
         self._cadwait_s = DEFAULT_CADWAIT_S
+        # True only after a valid CADWAIT was read from the connect handshake.
+        # Until then TX is inhibited (we must not size the result timeout from a
+        # silent default and risk declaring a result lost too early).
+        self._cadwait_valid = False
         # Exactly one TX is in flight at a time (the dispatcher serialises TX),
         # so a single pending-result slot is enough; no seq map is needed.
         self._pending_tx_result = None
@@ -323,6 +334,7 @@ class LoRaHAMInterface(Interface):
         # Drop any TX result left pending from a previous connection.
         self._fail_pending_tx()
         self._cadwait_s = DEFAULT_CADWAIT_S
+        self._cadwait_valid = False
 
         self._data_reader, self._data_writer = await self._open_unix_connection(
             self.data_socket,
@@ -422,6 +434,7 @@ class LoRaHAMInterface(Interface):
                         self._cadwait_s = max(
                             int(fields["CADWAIT"]) / 1000.0, 0.0
                         )
+                        self._cadwait_valid = True
                         logger.info(
                             "LoRaHAM CADWAIT=%s ms", fields["CADWAIT"]
                         )
@@ -590,9 +603,11 @@ class LoRaHAMInterface(Interface):
             )
 
     def _deliver_tx_result(self, payload):
-        if len(payload) < FRAMED_DATA_TX_RESULT_PAYLOAD_LEN:
+        # TX_RESULT payload is exactly 4 bytes; any other length is malformed.
+        # Ignore it (do not resolve the pending future) and let the timeout act.
+        if len(payload) != FRAMED_DATA_TX_RESULT_PAYLOAD_LEN:
             logger.warning(
-                "Ignoring short LoRaHAM TX_RESULT frame: %s bytes", len(payload)
+                "Ignoring malformed LoRaHAM TX_RESULT frame: %s bytes", len(payload)
             )
             return
 
@@ -676,6 +691,8 @@ class LoRaHAMInterface(Interface):
     async def _close_sockets(self):
         # Resolve any in-flight transmit so it does not hang across reconnect.
         self._fail_pending_tx()
+        # CADWAIT must be re-learned from the next connect handshake before TX.
+        self._cadwait_valid = False
 
         writers = (self._data_writer, self._config_writer)
 
@@ -737,68 +754,97 @@ class LoRaHAMInterface(Interface):
             logger.debug("LoRaHAM daemon TX disabled; packet discarded")
             return 0
 
-        if self._data_writer is None:
-            logger.warning("LoRaHAM data socket not connected; packet not sent")
-            return 0
+        # Serialise the whole transaction so at most one TX_RESULT is pending.
+        async with self._tx_lock:
+            if self._data_writer is None:
+                logger.warning("LoRaHAM data socket not connected; packet not sent")
+                return 0
 
-        airtime_ms = self._calculate_airtime_ms(len(tx_packet))
-        timeout = self._cadwait_s + (airtime_ms / 1000.0) + self.tx_result_margin
+            # Do not transmit until a valid CADWAIT is known: sizing the result
+            # timeout from the silent default could declare a result lost too
+            # early (-> reconnect -> possible RF duplication).
+            if not self._cadwait_valid:
+                logger.warning(
+                    "LoRaHAM CADWAIT not known yet; packet not sent (RX continues)"
+                )
+                return 0
 
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        # Arm the pending slot before writing so a fast TX_RESULT is not missed.
-        self._pending_tx_result = future
+            airtime_ms = self._calculate_airtime_ms(len(tx_packet))
+            timeout = self._cadwait_s + (airtime_ms / 1000.0) + self.tx_result_margin
 
-        try:
-            await self._write_frame(FRAMED_DATA_TYPE_TX_PACKET, tx_packet)
-        except Exception as exc:
-            if self._pending_tx_result is future:
-                self._pending_tx_result = None
-            logger.error("LoRaHAM daemon TX failed: %s", exc)
-            return 0
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            # Arm the pending slot before writing so a fast TX_RESULT is not missed.
+            self._pending_tx_result = future
 
-        try:
-            result = await asyncio.wait_for(future, timeout=timeout)
-        except TimeoutError:
-            if self._pending_tx_result is future:
-                self._pending_tx_result = None
-            logger.warning(
-                "No LoRaHAM TX_RESULT after %.2f s; packet result lost, reconnecting",
-                timeout,
-            )
-            self._request_reconnect()
-            return 0
+            try:
+                await self._write_frame(FRAMED_DATA_TYPE_TX_PACKET, tx_packet)
+            except Exception as exc:
+                if self._pending_tx_result is future:
+                    self._pending_tx_result = None
+                logger.error("LoRaHAM daemon TX failed: %s", exc)
+                return 0
 
-        if result is None:
-            # Resolved by an ERROR frame or a connection drop.
-            logger.warning("LoRaHAM TX aborted before a result was received")
-            return 0
+            try:
+                result = await asyncio.wait_for(future, timeout=timeout)
+            except TimeoutError:
+                if self._pending_tx_result is future:
+                    self._pending_tx_result = None
+                logger.warning(
+                    "No LoRaHAM TX_RESULT after %.2f s; packet result lost, reconnecting",
+                    timeout,
+                )
+                self._request_reconnect()
+                return 0
 
-        status, flags, seq = result
-        logger.debug(
-            "LoRaHAM TX_RESULT status=%s flags=0x%02X seq=%s", status, flags, seq
-        )
+            if result is None:
+                # Resolved by an ERROR frame or a connection drop.
+                logger.warning("LoRaHAM TX aborted before a result was received")
+                return 0
 
-        if status == TX_RESULT_STATUS_OK:
-            self.airtime_txtimestamp.append(time.time())
-            self.airtime_txtime.append(airtime_ms)
+            status, flags, seq = result
             logger.debug(
-                "Sent LoRaHAM TX packet, %s bytes, airtime %.2f ms",
-                len(tx_packet),
-                airtime_ms,
+                "LoRaHAM TX_RESULT status=%s flags=0x%02X seq=%s", status, flags, seq
             )
-            return airtime_ms
 
-        if status in (TX_RESULT_STATUS_BUSY, TX_RESULT_STATUS_CAD_TIMEOUT):
-            # Channel was busy; the daemon did not transmit. MeshCore decides on
-            # retransmission, so do not count airtime.
-            logger.info(
-                "LoRaHAM channel busy (status=%s); packet not sent", status
+            if status == TX_RESULT_STATUS_OK:
+                # OK also covers send-after-CAD-timeout (flag 0x04): transmitted.
+                self.airtime_txtimestamp.append(time.time())
+                self.airtime_txtime.append(airtime_ms)
+                logger.debug(
+                    "Sent LoRaHAM TX packet, %s bytes, airtime %.2f ms",
+                    len(tx_packet),
+                    airtime_ms,
+                )
+                return airtime_ms
+
+            if status in (TX_RESULT_STATUS_BUSY, TX_RESULT_STATUS_CHANNEL_BUSY):
+                # Channel busy; the daemon did not transmit. MeshCore decides on
+                # retransmission, so do not count airtime.
+                logger.info(
+                    "LoRaHAM channel busy (status=%s); packet not sent", status
+                )
+                return 0
+
+            if status in (TX_RESULT_STATUS_RADIO_NOT_READY,
+                          TX_RESULT_STATUS_RADIO_ERROR):
+                logger.error(
+                    "LoRaHAM radio error (status=%s seq=%s); packet not sent",
+                    status, seq,
+                )
+                return 0
+
+            if status in (TX_RESULT_STATUS_INVALID_PACKET,
+                          TX_RESULT_STATUS_INVALID_BAND):
+                logger.error(
+                    "LoRaHAM rejected packet (status=%s seq=%s)", status, seq
+                )
+                return 0
+
+            logger.error(
+                "LoRaHAM unknown TX_RESULT status=%s seq=%s", status, seq
             )
             return 0
-
-        logger.error("LoRaHAM TX failed (status=%s seq=%s)", status, seq)
-        return 0
 
     def transmit_wait(self):
         """
