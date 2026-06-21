@@ -285,12 +285,12 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
     # --- P2b CADWAIT inhibit ------------------------------------------------
 
     async def test_tx_inhibited_without_valid_cadwait(self):
-        # Status reply omits CADWAIT -> _cadwait_valid stays False -> TX must not
-        # be sent with the silent default timeout (RX keeps working).
+        # Status reply omits CADWAIT -> _tx_ready stays False -> TX must not be
+        # sent with the silent default timeout (RX keeps working).
         daemon = await self.make_daemon(cadwait_ms=None)
         iface = await self.connect_interface(daemon, connect_timeout=0.2)
 
-        self.assertFalse(iface._cadwait_valid)
+        self.assertFalse(iface._tx_ready)
         result = await asyncio.wait_for(iface.transmit(b"nope"), timeout=1.0)
         self.assertEqual(result, 0)
         self.assertNotIn(b"nope", daemon.tx_packets)
@@ -299,6 +299,73 @@ class LoRaHAMInterfaceFunctionalTests(unittest.IsolatedAsyncioTestCase):
         await daemon.send_rx(b"rx")
         rf, _r, _s = await asyncio.wait_for(iface.rx_q.get(), timeout=1.0)
         self.assertEqual(rf, b"rx")
+
+    # --- P2 TXMODE/TXRESULT handshake verification --------------------------
+
+    async def test_tx_inhibited_when_daemon_not_managed(self):
+        # CADWAIT valid but TXMODE=DIRECT -> TX inhibited.
+        daemon = await self.make_daemon(txmode="DIRECT")
+        iface = await self.connect_interface(daemon)
+        self.assertFalse(iface._tx_ready)
+        self.assertEqual(await asyncio.wait_for(iface.transmit(b"x"), timeout=1.0), 0)
+        self.assertNotIn(b"x", daemon.tx_packets)
+
+    async def test_tx_inhibited_when_txresult_disabled(self):
+        # CADWAIT valid, MANAGED, but TXRESULT=0 -> TX inhibited.
+        daemon = await self.make_daemon(txresult=0)
+        iface = await self.connect_interface(daemon)
+        self.assertFalse(iface._tx_ready)
+        self.assertEqual(await asyncio.wait_for(iface.transmit(b"x"), timeout=1.0), 0)
+        self.assertNotIn(b"x", daemon.tx_packets)
+
+    async def test_tx_ready_when_managed_and_txresult(self):
+        # CADWAIT + MANAGED + TXRESULT=1 -> TX allowed.
+        daemon = await self.make_daemon(txmode="MANAGED", txresult=1)
+        iface = await self.connect_interface(daemon)
+        self.assertTrue(iface._tx_ready)
+        airtime = await asyncio.wait_for(iface.transmit(b"ok"), timeout=1.0)
+        self.assertGreater(airtime, 0)
+
+    # --- P1a/P1b stale-result window ---------------------------------------
+
+    async def test_cancel_clears_pending_and_forces_reconnect(self):
+        # Daemon withholds the result; cancel the transmit() while it waits.
+        daemon = await self.make_daemon(respond_to_tx=False)
+        iface = await self.connect_interface(daemon)
+        writer = iface._data_writer
+
+        task = asyncio.create_task(iface.transmit(b"cancelme"))
+        await daemon.wait_tx(b"cancelme", timeout=1.0)  # armed + written
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        # Slot cleared, reconnect forced, TX gated.
+        self.assertIsNone(iface._pending_tx_result)
+        self.assertFalse(iface._tx_ready)
+        self.assertTrue(writer.is_closing())
+
+        # A late result for the cancelled TX must not resolve a new transmit:
+        # the closing writer makes a follow-up transmit refuse without arming.
+        result = await asyncio.wait_for(iface.transmit(b"after"), timeout=1.0)
+        self.assertEqual(result, 0)
+        self.assertIsNone(iface._pending_tx_result)
+
+    async def test_timeout_inhibits_tx_until_reconnect(self):
+        daemon = await self.make_daemon(respond_to_tx=False, cadwait_ms=10)
+        iface = await self.connect_interface(
+            daemon, sf=7, bw=500000, tx_result_margin=0.05)
+        writer = iface._data_writer
+
+        result = await asyncio.wait_for(iface.transmit(b"t"), timeout=1.0)
+        self.assertEqual(result, 0)
+        self.assertFalse(iface._tx_ready)
+        self.assertTrue(writer.is_closing())
+
+        # Follow-up on the closing writer: refused, no new future armed.
+        result2 = await asyncio.wait_for(iface.transmit(b"t2"), timeout=1.0)
+        self.assertEqual(result2, 0)
+        self.assertIsNone(iface._pending_tx_result)
 
     # --- P3 length validation ----------------------------------------------
 

@@ -187,10 +187,11 @@ class LoRaHAMInterface(Interface):
         self._tx_lock = asyncio.Lock()
         # Daemon-reported CAD wait timeout, used to size the TX_RESULT timeout.
         self._cadwait_s = DEFAULT_CADWAIT_S
-        # True only after a valid CADWAIT was read from the connect handshake.
-        # Until then TX is inhibited (we must not size the result timeout from a
-        # silent default and risk declaring a result lost too early).
-        self._cadwait_valid = False
+        # TX is allowed only after the connect handshake verified all of: a valid
+        # CADWAIT (to size the result timeout), TXMODE=MANAGED and TXRESULT=1
+        # (both global per-band, so another client could have changed them).
+        # Until then TX is inhibited; reset on disconnect/timeout/cancel.
+        self._tx_ready = False
         # Exactly one TX is in flight at a time (the dispatcher serialises TX),
         # so a single pending-result slot is enough; no seq map is needed.
         self._pending_tx_result = None
@@ -334,7 +335,7 @@ class LoRaHAMInterface(Interface):
         # Drop any TX result left pending from a previous connection.
         self._fail_pending_tx()
         self._cadwait_s = DEFAULT_CADWAIT_S
-        self._cadwait_valid = False
+        self._tx_ready = False
 
         self._data_reader, self._data_writer = await self._open_unix_connection(
             self.data_socket,
@@ -430,11 +431,12 @@ class LoRaHAMInterface(Interface):
                 if "RADIO" in fields:
                     logger.debug("LoRaHAM radio status: %s", fields["RADIO"])
                 if "CADWAIT" in fields:
+                    cadwait_ok = False
                     try:
                         self._cadwait_s = max(
                             int(fields["CADWAIT"]) / 1000.0, 0.0
                         )
-                        self._cadwait_valid = True
+                        cadwait_ok = True
                         logger.info(
                             "LoRaHAM CADWAIT=%s ms", fields["CADWAIT"]
                         )
@@ -442,6 +444,22 @@ class LoRaHAMInterface(Interface):
                         logger.warning(
                             "Bad LoRaHAM CADWAIT value: %s", fields["CADWAIT"]
                         )
+
+                    # TX is only ready when the daemon really is in MANAGED mode
+                    # with per-TX results enabled (both are global per-band state
+                    # another client could have changed). Verify on every
+                    # (re)connect handshake; RX-only clients never gate on this.
+                    if self.enable_tx:
+                        txmode = fields.get("TXMODE")
+                        txresult = fields.get("TXRESULT")
+                        if cadwait_ok and txmode == "MANAGED" and txresult == "1":
+                            self._tx_ready = True
+                        else:
+                            logger.warning(
+                                "LoRaHAM TX not ready: CADWAIT_ok=%s TXMODE=%s "
+                                "TXRESULT=%s; TX inhibited",
+                                cadwait_ok, txmode, txresult,
+                            )
                     return
 
     def _calculate_airtime_ms(self, payload_len):
@@ -692,7 +710,7 @@ class LoRaHAMInterface(Interface):
         # Resolve any in-flight transmit so it does not hang across reconnect.
         self._fail_pending_tx()
         # CADWAIT must be re-learned from the next connect handshake before TX.
-        self._cadwait_valid = False
+        self._tx_ready = False
 
         writers = (self._data_writer, self._config_writer)
 
@@ -756,16 +774,18 @@ class LoRaHAMInterface(Interface):
 
         # Serialise the whole transaction so at most one TX_RESULT is pending.
         async with self._tx_lock:
-            if self._data_writer is None:
+            # Reject a missing or already-closing transport so a result of a
+            # timed-out/cancelled TX cannot be inherited by a new future before
+            # the reconnect handshake re-establishes a fresh stream.
+            if self._data_writer is None or self._data_writer.is_closing():
                 logger.warning("LoRaHAM data socket not connected; packet not sent")
                 return 0
 
-            # Do not transmit until a valid CADWAIT is known: sizing the result
-            # timeout from the silent default could declare a result lost too
-            # early (-> reconnect -> possible RF duplication).
-            if not self._cadwait_valid:
+            # TX is allowed only after the handshake verified CADWAIT + MANAGED +
+            # TXRESULT=1. Otherwise inhibit (RX keeps working).
+            if not self._tx_ready:
                 logger.warning(
-                    "LoRaHAM CADWAIT not known yet; packet not sent (RX continues)"
+                    "LoRaHAM TX not ready (CADWAIT/TXMODE/TXRESULT); packet not sent"
                 )
                 return 0
 
@@ -779,22 +799,29 @@ class LoRaHAMInterface(Interface):
 
             try:
                 await self._write_frame(FRAMED_DATA_TYPE_TX_PACKET, tx_packet)
-            except Exception as exc:
+                result = await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.CancelledError:
+                # Clear our slot before unwinding so a late TX_RESULT cannot be
+                # mis-associated with the next transmit(); force a fresh handshake.
                 if self._pending_tx_result is future:
                     self._pending_tx_result = None
-                logger.error("LoRaHAM daemon TX failed: %s", exc)
-                return 0
-
-            try:
-                result = await asyncio.wait_for(future, timeout=timeout)
+                self._tx_ready = False
+                self._request_reconnect()
+                raise
             except TimeoutError:
                 if self._pending_tx_result is future:
                     self._pending_tx_result = None
+                self._tx_ready = False
                 logger.warning(
                     "No LoRaHAM TX_RESULT after %.2f s; packet result lost, reconnecting",
                     timeout,
                 )
                 self._request_reconnect()
+                return 0
+            except Exception as exc:
+                if self._pending_tx_result is future:
+                    self._pending_tx_result = None
+                logger.error("LoRaHAM daemon TX failed: %s", exc)
                 return 0
 
             if result is None:

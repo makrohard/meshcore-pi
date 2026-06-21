@@ -136,8 +136,11 @@ The daemon delivers exactly one final `TX_RESULT` per `TX_PACKET`. The whole TX
 transaction (arm pending result -> write -> await -> consume) is serialised, so
 at most one result is outstanding at a time; the `seq` field is logged as a
 sanity check. A TX_RESULT whose payload is not exactly 4 bytes is treated as
-malformed and ignored. When TX is enabled, the interface only transmits once a
-valid `CADWAIT` has been read from the connect handshake (no silent default).
+malformed and ignored. When TX is enabled, the interface only transmits once the
+connect handshake has verified a valid `CADWAIT` **and** `TXMODE=MANAGED` **and**
+`TXRESULT=1` (both are global per-band daemon state another client could change);
+otherwise TX is inhibited while RX keeps working. A timed-out or cancelled TX
+clears the pending slot and forces a reconnect handshake before the next TX.
 
 Packet length is validated before writing a `TX_PACKET` frame. `transmit()`
 returns the calculated LoRa airtime in milliseconds (on success) for dispatcher

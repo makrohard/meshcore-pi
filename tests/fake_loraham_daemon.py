@@ -35,6 +35,8 @@ class FakeLoRaHAMDaemon:
         tx_result_flags=0x01,
         tx_result_payload_len=4,
         cadwait_ms=1500,
+        txmode="MANAGED",
+        txresult=1,
     ):
         self.root = Path(root)
         self.data_socket = self.root / "lora868f.sock"
@@ -55,6 +57,9 @@ class FakeLoRaHAMDaemon:
         # Reported in the GET STATUS reply. None omits CADWAIT entirely; a
         # non-numeric value yields a malformed CADWAIT field (for tests).
         self.cadwait_ms = cadwait_ms
+        # TXMODE/TXRESULT reported by GET STATUS (global per-band daemon state).
+        self.txmode = txmode
+        self.txresult = txresult
 
         self.data_server = None
         self.config_server = None
@@ -111,7 +116,8 @@ class FakeLoRaHAMDaemon:
             cadwait = f"CADWAIT={self.cadwait_ms} "
         return (
             f"STATUS RADIO=READY TX={1 if self.tx else 0} "
-            f"CAD={1 if self.cad else 0} GETRSSI=0 TXRESULT=1 TXQUEUE=1 "
+            f"CAD={1 if self.cad else 0} GETRSSI=0 TXRESULT={self.txresult} "
+            f"TXMODE={self.txmode} TXQUEUE=1 "
             f"{cadwait}CADIDLE=250 CADPOLL=50 "
             f"CADTXAFTERTIMEOUT=0\n"
         )
