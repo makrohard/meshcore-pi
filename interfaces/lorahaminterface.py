@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import math
+import os
+import stat
 import time
 import re
 
@@ -13,6 +15,21 @@ from configuration import ConfigView, get_config
 from .interface import Interface
 
 logger = logging.getLogger(__name__)
+
+
+def _loraham_sockpath(configured):
+    """systemd deployments serve the daemon sockets under /run/loraham; direct/user starts under /tmp
+    (LORAHAM_SOCKET_DIR). Prefer the /run/loraham path when the socket already exists there, else the
+    configured (/tmp) path — mirrors the daemon's clients (lorachat/igate)."""
+    if not configured:
+        return configured
+    run = os.path.join("/run/loraham", os.path.basename(configured))
+    try:
+        if stat.S_ISSOCK(os.stat(run).st_mode):
+            return run
+    except OSError:
+        pass
+    return configured
 
 VALID_BANDWIDTHS_HZ = {
     7800,
@@ -149,8 +166,8 @@ class LoRaHAMInterface(Interface):
         config.set_default(get_config(defaults))
 
         self.preset = config.get("preset")
-        self.data_socket = config.get("data_socket")
-        self.config_socket = config.get("config_socket")
+        self.data_socket = _loraham_sockpath(config.get("data_socket"))
+        self.config_socket = _loraham_sockpath(config.get("config_socket"))
 
         self.freq = config.get("frequency")
         self.sf = config.get("sf")
