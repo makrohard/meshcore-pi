@@ -1,10 +1,62 @@
 import asyncio
 
 from binascii import hexlify
+import ipaddress
 import struct
 
 import logging
 logger = logging.getLogger(__name__)
+
+
+_LOOPBACK_NET = ipaddress.ip_network('127.0.0.0/8')
+_DEFAULT_ALLOW = ipaddress.ip_network('127.0.0.1/32')
+
+
+def parse_allow_network(value):
+    """
+    Parse an allow-list entry (a bare IPv4 address or a CIDR) into an ip_network.
+
+    A bare address becomes a /32. IPv4 only: an IPv6 value or any parse error
+    fails closed to loopback-only (127.0.0.1/32) so a typo can never silently
+    expose the port, and derive_listen_host stays address-family consistent.
+    """
+    try:
+        net = ipaddress.ip_network(str(value), strict=False)
+    except ValueError as e:
+        logger.error(f"Invalid companion 'allow' value {value!r}, "
+                     f"failing closed to 127.0.0.1: {e}")
+        return _DEFAULT_ALLOW
+    if net.version != 4:
+        logger.error(f"Companion 'allow' value {value!r} is not IPv4 "
+                     f"(IPv6 allow-lists are not supported) — failing closed to 127.0.0.1")
+        return _DEFAULT_ALLOW
+    return net
+
+
+def derive_listen_host(net):
+    """
+    Derive the bind address from the allow-network: loopback when the allowed
+    range sits within 127.0.0.0/8 (so the port stays unexposed), otherwise all
+    interfaces (0.0.0.0) with the source filter applied on accept.
+    """
+    try:
+        if net.version == 4 and net.subnet_of(_LOOPBACK_NET):
+            return '127.0.0.1'
+    except TypeError:
+        pass
+    return '0.0.0.0'
+
+
+def peer_allowed(net, addr):
+    """
+    True if a peer address is inside the allow-network. Fails closed (False) on
+    any parse or address-family mismatch.
+    """
+    try:
+        return ipaddress.ip_address(addr) in net
+    except (ValueError, TypeError):
+        return False
+
 
 class BaseCompanionInterface:
     """
@@ -39,7 +91,17 @@ class CompanionInterface(BaseCompanionInterface):
         super().__init__()
 
         self.port = config.get('port', 5000)
-        self.listen = config.get('listen', None)
+
+        # Source-IP allow-list. Only peers inside this network may connect; the
+        # MeshCore companion protocol has no authentication, so this is the one
+        # gate on remote access. Default 127.0.0.1 => loopback only.
+        self._allow_net = parse_allow_network(config.get('allow', '127.0.0.1'))
+
+        # `allow` derives the bind address; an explicit `listen` overrides it
+        # (advanced). Deriving keeps the port unexposed unless the operator
+        # widens `allow`.
+        listen = config.get('listen', None)
+        self.listen = listen if listen is not None else derive_listen_host(self._allow_net)
 
         self._reader = None
         self._writer = None
@@ -141,7 +203,15 @@ class CompanionInterface(BaseCompanionInterface):
         logger.debug("Data sent to app device.")
 
     async def connected(self, reader, writer):
-        addr = writer.get_extra_info('peername')[0]
+        peer = writer.get_extra_info('peername')
+        addr = peer[0] if peer else None
+
+        # The allow-list is the ONLY access gate (no auth). If the peer address is
+        # unavailable we cannot verify it, so fail closed.
+        if addr is None or not peer_allowed(self._allow_net, addr):
+            logger.info(f"[wifi] rejected connection from {peer} (not in allow-list)")
+            writer.close()
+            return
 
         logger.debug(f"Connection callback - client has connected from {addr}")
 

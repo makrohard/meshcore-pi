@@ -132,7 +132,13 @@ add_public_channel = true
 interface = "wifi"
 
 # wifi.port = 5000
-# Default is all interfaces (v4 and v6)
+# Source-IP allow-list (IPv4 or CIDR). Only peers inside it may connect, and it
+# derives the bind address: loopback for 127.0.0.0/8, else all interfaces.
+# Default 127.0.0.1 = loopback only (port not exposed). The companion protocol
+# has NO authentication, so anyone allowed to connect can transmit on your
+# station - keep this narrow; prefer a VPN/SSH tunnel for remote access.
+# wifi.allow = "192.168.0.0/24"
+# wifi.listen overrides the address derived from wifi.allow (advanced).
 # wifi.listen = '0.0.0.0'
 
 # Serial port

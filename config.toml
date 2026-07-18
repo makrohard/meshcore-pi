@@ -92,7 +92,12 @@ add_public_channel = true
 
 interface = "wifi"
 # wifi.port = 5000
-# wifi.listen = all interfaces
+# Source-IP allow-list (IPv4 or CIDR). Default 127.0.0.1 = loopback only.
+# Widen to expose the port, e.g. wifi.allow = "192.168.0.0/24" for a LAN.
+# The companion protocol has NO authentication - keep the allow-list narrow.
+# wifi.allow = "127.0.0.1"
+# wifi.listen overrides the address derived from wifi.allow (advanced).
+# wifi.listen = "0.0.0.0"
 
 # interface = "serial"
 # serial.port = "/dev/tnt0"

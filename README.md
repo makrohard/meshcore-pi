@@ -230,7 +230,8 @@ The ``devices`` option selects which of the device profiles defined in the
 config file are in use.
 
 The default config file creates a single companion radio listening on
-port 5000, with a randomly-created private key.
+port 5000 (loopback only — see "Remote access" below), with a
+randomly-created private key.
 
 You can use a private key from the MeshCore app. If you want to use the
 randomly-generated key again, it will be displayed at startup and recorded
@@ -242,6 +243,37 @@ MeshCore browser app, change the config to a serial port (see above
 regarding serial interfaces) and connect to that.
 
 At present, Bluetooth connections are not supported.
+
+### Remote access (`wifi.allow`)
+
+By default the WiFi companion interface listens on loopback only, so the
+Node Manager and `meshcore-cli` must run on the same Pi. To drive this node
+from another machine, widen the source-IP allow-list with `wifi.allow` in the
+companion device config (a bare IPv4 address is treated as a `/32`):
+
+| `wifi.allow`          | Who may connect  | Listens on  |
+|-----------------------|------------------|-------------|
+| `127.0.0.1` (default) | this host only   | `127.0.0.1` |
+| `192.168.0.0/24`      | that LAN subnet  | `0.0.0.0`   |
+| `10.0.0.5`            | one host (`/32`) | `0.0.0.0`   |
+| `0.0.0.0/0`           | anyone           | `0.0.0.0`   |
+
+`wifi.allow` also derives the bind address: loopback when the allowed range is
+within `127.0.0.0/8` (the port stays unexposed), otherwise all interfaces
+(`0.0.0.0`) with the source filter applied on connect. `wifi.listen` sets the
+bind address explicitly (advanced) while the allow-list still comes from
+`wifi.allow`. Connections from outside the allow-list are refused and logged
+(`[wifi] rejected connection from <ip> (not in allow-list)`); an invalid or
+IPv6 `wifi.allow` (IPv4 only) fails closed to loopback.
+
+The clients need no changes — point the Node Manager (TCP transport) or
+`meshcore-cli -t <PiIP> -p 5000` at the Pi. The companion server is
+single-client: only one remote app connects at a time.
+
+**The MeshCore companion protocol has no authentication and this node adds
+none.** Anyone allowed to connect can transmit on your station and read
+received traffic. Keep the allow-list as narrow as possible; for access beyond
+a trusted LAN, prefer a VPN or SSH tunnel and leave `wifi.allow = "127.0.0.1"`.
 
 Other files
 -----------

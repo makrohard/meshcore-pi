@@ -54,6 +54,10 @@ add_public_channel = true
 
 # Local companion TCP endpoint for Node Manager / meshcore-cli.
 interface = "wifi"
-listen = "127.0.0.1"
-port = 5000
+# Source-IP allow-list (IPv4 or CIDR). Default 127.0.0.1 = loopback only — the port
+# is NOT exposed. Widen to expose, e.g. wifi.allow = "192.168.0.0/24" (a LAN) or
+# "0.0.0.0/0" (anyone). The companion protocol has NO authentication, so keep the
+# allow-list as narrow as possible. wifi.listen overrides the derived bind address
+# (advanced); wifi.port changes the port (default 5000).
+wifi.allow = "127.0.0.1"
 # privatekey = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
