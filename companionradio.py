@@ -22,6 +22,20 @@ logger = logging.getLogger(__name__)
 
 # ------------ Frame Protocol --------------
 
+# The companion protocol version this node ADVERTISES.
+#
+# Clients parse RESP_CODE_DEVICE_INFO according to this number and gate features on it, so
+# it is a promise about implemented semantics, not a badge. The current reference client
+# (meshcore_py) reads:
+#     >= 3   max_contacts, max_channels, ble_pin, fw_build, model, ver   <- implemented
+#     >= 9   a trailing `repeat` (repeater mode) byte                    <- NOT sent
+#     >= 10  a trailing `path_hash_mode` byte                            <- NOT sent
+# and current firmware's 13 additionally allows non-contact requests, which this node does
+# not implement either.
+#
+# Raising this to match current firmware without sending those fields would make a client
+# read bytes that are not there. It stays at the highest version whose semantics are
+# genuinely implemented; a client then simply does not ask for what is missing.
 FIRMWARE_VER_CODE = 5
 
 FIRMWARE_BUILD_DATE = "9 May 2025"
@@ -46,7 +60,8 @@ CMD_SHARE_CONTACT = 16
 CMD_EXPORT_CONTACT = 17
 CMD_IMPORT_CONTACT = 18
 CMD_REBOOT = 19
-CMD_GET_BATTERY_VOLTAGE = 20
+CMD_GET_BATT_AND_STORAGE = 20   # renamed upstream from CMD_GET_BATTERY_VOLTAGE
+CMD_GET_BATTERY_VOLTAGE = CMD_GET_BATT_AND_STORAGE   # old name, same command number
 CMD_SET_TUNING_PARAMS = 21
 CMD_DEVICE_QUERY = 22
 CMD_EXPORT_PRIVATE_KEY = 23
@@ -82,7 +97,8 @@ RESP_CODE_CHANNEL_MSG_RECV = 8  # a reply to CMD_SYNC_NEXT_MESSAGE (ver < 3)
 RESP_CODE_CURR_TIME = 9  # a reply to CMD_GET_DEVICE_TIME
 RESP_CODE_NO_MORE_MESSAGES = 10  # a reply to CMD_SYNC_NEXT_MESSAGE
 RESP_CODE_EXPORT_CONTACT = 11
-RESP_CODE_BATTERY_VOLTAGE = 12  # a reply to CMD_GET_BATTERY_VOLTAGE
+RESP_CODE_BATT_AND_STORAGE = 12  # a reply to CMD_GET_BATT_AND_STORAGE
+RESP_CODE_BATTERY_VOLTAGE = RESP_CODE_BATT_AND_STORAGE   # old name, same code
 RESP_CODE_DEVICE_INFO = 13  # a reply to CMD_DEVICE_QUERY
 RESP_CODE_PRIVATE_KEY = 14  # a reply to CMD_EXPORT_PRIVATE_KEY
 RESP_CODE_DISABLED = 15
@@ -108,6 +124,10 @@ PUSH_CODE_TRACE_DATA = 0x89
 PUSH_CODE_NEW_ADVERT = 0x8A
 PUSH_CODE_TELEMETRY_RESPONSE = 0x8B
 
+# There is no battery on a Pi. 0xffff is not a plausible cell voltage, so it reads as an
+# explicit "not applicable" while still showing as full rather than as a dying node.
+BATTERY_NOT_APPLICABLE_MV = 0xffff
+
 ERR_CODE_UNSUPPORTED_CMD = 1
 ERR_CODE_NOT_FOUND = 2
 ERR_CODE_TABLE_FULL = 3
@@ -127,6 +147,32 @@ MAX_SIGN_DATA_LEN = 8 * 1024  # 8K
 OK = bytes([RESP_CODE_OK])
 def ERR(code):
     return bytes([RESP_CODE_ERR, code])
+
+def batt_and_storage_resp():
+    """The reply to CMD_GET_BATT_AND_STORAGE (command 20).
+
+        uint8  RESP_CODE_BATT_AND_STORAGE
+        uint16 battery millivolts
+        uint32 storage used, KB
+        uint32 storage total, KB
+
+    Current firmware answers with battery AND storage; this node used to send only the
+    2-byte battery, which current clients tolerate but which silently omits the storage
+    fields. Both values are explicit not-applicable markers rather than invented numbers —
+    see BATTERY_NOT_APPLICABLE_MV, and storage 0/0 meaning "not reported" rather than
+    passing off the host filesystem as device flash.
+    """
+    return struct.pack("<BHII", RESP_CODE_BATT_AND_STORAGE,
+                       BATTERY_NOT_APPLICABLE_MV, 0, 0)
+
+
+def device_info_resp(num_channels):
+    """The reply to CMD_DEVICE_QUERY, in the layout FIRMWARE_VER_CODE promises."""
+    return (struct.pack("<BBBBL", RESP_CODE_DEVICE_INFO, FIRMWARE_VER_CODE,
+                        255, num_channels, 123456)
+            + pad(FIRMWARE_BUILD_DATE, 12) + pad("Python Companion", 40)
+            + pad(FIRMWARE_VERSION, 20))
+
 
 def sent_resp(sentpacket:packet.MC_Outgoing, tag:bytes):
         # Response to various commands that send requests over the mesh
@@ -861,20 +907,26 @@ class CompanionRadio(BasicMesh):
                 # We haven't really defined the maximum number of contacts.
                 # Maximum channels is arbritarily set in channel.py
                 # Set it to the max, 510 (255*2). Set the BLE PIN code to 123456
-                response = struct.pack("<BBBBL", RESP_CODE_DEVICE_INFO, FIRMWARE_VER_CODE, 255, len(self.channels), 123456)
+                response = device_info_resp(len(self.channels))
 
-                response += pad(FIRMWARE_BUILD_DATE, 12) + pad("Python Companion", 40) + pad(FIRMWARE_VERSION, 20)
+            elif command == CMD_GET_BATT_AND_STORAGE:
+                logger.debug(f"CMD_GET_BATT_AND_STORAGE")
 
-            elif command == CMD_GET_BATTERY_VOLTAGE:
-                # Respond with fake battery voltage
-                logger.debug(f"CMD_GET_BATTERY_VOLTAGE")
-
-                # Battery is apparently at 4V (4000mV)
-                #response = struct.pack("<BH", RESP_CODE_BATTERY_VOLTAGE, 4000)
-
-                # Show battery at 0xffff (65.536V) - it's a bogus value, but clearly so, and will still show as
-                # 100% in the client
-                response = struct.pack("<BH", RESP_CODE_BATTERY_VOLTAGE, 0xffff)
+                # Current firmware answers this with battery AND storage:
+                #   uint16 battery mV | uint32 storage used KB | uint32 storage total KB
+                # This node used to send only the 2-byte battery, which current clients
+                # tolerate but which silently drops the storage fields.
+                #
+                # Both values here are deliberately NOT-APPLICABLE markers rather than
+                # invented numbers:
+                #  * a Pi has no battery. 0xffff (65.535 V) is obviously not a real cell
+                #    voltage and still reads as "full" in clients, which is the least
+                #    disruptive way to say "not powered by a battery". Reporting 0 would
+                #    show a flat battery and invite false low-power warnings.
+                #  * storage 0/0 means "not reported". The node's contacts live in a file
+                #    on the host filesystem; reporting that filesystem's free space as if
+                #    it were device flash would be a misleading number, not a useful one.
+                response = batt_and_storage_resp()
 
             elif command == CMD_GET_CONTACT_BY_KEY:
                 key = frame[1:]
@@ -976,8 +1028,12 @@ class CompanionRadio(BasicMesh):
                     response = struct.pack("<BLB", RESP_CODE_ADVERT_PATH, contact.rxtime, len(contact.advertpath)) + bytes(contact.advertpath)
 
             else:
-                logger.warning(f"Unknown command: {command}")
-                response = ERR(ERR_CODE_NOT_FOUND)
+                # UNSUPPORTED_CMD, not NOT_FOUND: the command is one this node does not
+                # implement, which is different from a lookup that found nothing. Current
+                # clients probe for newer features, and the right answer is "I do not
+                # support that", never a misleading not-found or a fake success.
+                logger.warning(f"Unsupported command: {command}")
+                response = ERR(ERR_CODE_UNSUPPORTED_CMD)
 
             if response is None:
                 logger.debug("No response to send")
