@@ -32,17 +32,22 @@ class Repeater(CLIDevice):
 
         # Trace is 4+4+1 bytes (tag, auth, flags) plus a path
         # We only care about the path; the other bits are for the originating client
-        if len(rx_packet.tracepath) == len(rx_packet.path):
+        # Compare HOPS, not bytes: `tracepath` entries are `1 << (flags & 3)` bytes each,
+        # while `path` collects one SNR byte per hop. A byte-to-byte comparison declared a
+        # 2/4/8-byte-hash trace finished (or over-long) while it still had hops to walk.
+        hops = rx_packet.trace_hops
+        done = len(rx_packet.path)
+        if done == hops:
             # Have reached the last hop. Repeaters don't originate traces(?), so ignore
             logger.debug("End of trace reached. Not for us.")
-        elif len(rx_packet.tracepath) < len(rx_packet.path):
+        elif done > hops:
             # Packet path (SNR data) is longer than trace path - something is wrong
             raise InvalidMeshcorePacket("Trace data is longer than trace path")
         else:
-            currenthop = rx_packet.tracepath[len(rx_packet.path)]
-            logger.debug(f"Current hop is: {hex(currenthop)}")
+            currenthop = rx_packet.trace_hop(done)
+            logger.debug(f"Current hop is: {currenthop.hex() if currenthop else None}")
 
-            if currenthop == self.me.hash:
+            if currenthop == self.me.path_hash(rx_packet.trace_hash_size):
                 # Current hop matches my pubkey hash, so this is (probably) for me
                 # Add the current packet SNR to the path
                 rx_packet.path += bytes([int(rx_packet.snr * 4) & 0xff])

@@ -461,12 +461,18 @@ class MC_Outgoing(MC_Packet):
     Base class of all outbound Meshcore packets.
     """
 
-    def __init__(self, type=None, path=None):
+    def __init__(self, type=None, path=None, path_hash_size=1):
         super().__init__()
 
         if type is None:
             raise ValueError("Packet type needs to be set")
-        
+
+        # A path is (bytes-per-hop, bytes) — the two travel together or the hop count on
+        # the wire is wrong. Set BEFORE validation: a legal 32-hop route of 2-byte hashes
+        # is 64 bytes, which looked like 64 one-byte hops and was rejected while the size
+        # was still its default.
+        self.path_hash_size = path_hash_size or 1
+
         if path is None:
             # Flood
             self.route = self.ROUTE_FLOOD
@@ -823,11 +829,7 @@ class MC_SrcDest_Out(MC_Outgoing):
         # Defaults to flood until updated by a PATH packet from the destination
         path = dest.path
 
-        super().__init__(type, path)
-        # The route was learned with a specific bytes-per-hop; re-encoding it as 1-byte
-        # hops would put a different (and wrong) hop count on the wire.
-        if path is not None:
-            self.path_hash_size = getattr(dest, "path_hash_size", 1) or 1
+        super().__init__(type, path, path_hash_size=getattr(dest, "path_hash_size", 1))
         self.src = src
         self.srchash = src.hash
         self.destination = dest
@@ -1065,9 +1067,11 @@ class MC_Ack_Outgoing(MC_Outgoing):
     Input:
         * packet - the message to acknowledge, as we can extract the ackhash from there
         * path - path to return the ack via
+        * path_hash_size - bytes per hop in `path`; must match the route it was learned
+          from, or the ACK is addressed to a hop count the mesh does not have
     """
-    def __init__(self, packet:MC_Text, path=[]):
-        super().__init__(self.TYPE_ACK, path)
+    def __init__(self, packet:MC_Text, path=[], path_hash_size=1):
+        super().__init__(self.TYPE_ACK, path, path_hash_size=path_hash_size)
 
         self.ackhash = packet.message_ackhash()
 
@@ -1297,7 +1301,8 @@ class MC_AnonReq_Out(MC_Outgoing):
     def __init__(self, src, dest, password, since=None):
 
         # Path to destination is taken from the destination Identity
-        super().__init__(self.TYPE_ANON_REQ, dest.path)
+        super().__init__(self.TYPE_ANON_REQ, dest.path,
+                         path_hash_size=getattr(dest, "path_hash_size", 1))
         self.src = src
         self.srchash = src.hash
         self.destination = dest
@@ -1343,17 +1348,47 @@ class MC_Trace(MC_Incoming):
         """
         super().__init__(packet)
 
-        # At least 10 bytes: tag (4), auth (4), flag (1) and at least one path element (1 byte each)
+        # At least 10 bytes: tag (4), auth (4), flags (1) and at least one path entry
         self.minpayload(10)
 
-        # No more than 64 path elements
-        if len(self.payload) > 8+1+64:
+        # No more than MAX_PATH_SIZE bytes of supplied path
+        if len(self.payload) > 8 + 1 + self.MAX_PATH_SIZE:
             raise InvalidMeshcorePacket("Too long")
-        
+
         self.tag = self.payload[0:4]
         self.auth = self.payload[4:8]
         self.flags = self.payload[8]
+        # The supplied route to walk. Its entries are `1 << (flags & 3)` bytes each — the
+        # low two bits of `flags` are a SHIFT, not a count. Treating one byte as one hop
+        # dropped an otherwise complete 2/4/8-byte-hash trace as unfinished.
         self.tracepath = self.payload[9:]
+
+    @property
+    def trace_hash_size(self):
+        """Bytes per entry in `tracepath` (`1 << (flags & 3)`)."""
+        return 1 << (self.flags & 0x03)
+
+    @property
+    def trace_hops(self):
+        """How many hops the supplied route contains."""
+        return len(self.tracepath) // self.trace_hash_size
+
+    @property
+    def trace_completed(self):
+        """True once an SNR has been collected for every hop.
+
+        `self.path` holds one SNR BYTE per hop (upstream appends `snr*4`, not a hash), so
+        the comparison is hops-to-hops, never bytes-to-bytes.
+        """
+        return len(self.path) >= self.trace_hops
+
+    def trace_hop(self, index):
+        """The `index`-th hop of the supplied route, as bytes (entry-width aware)."""
+        size = self.trace_hash_size
+        start = index * size
+        if start + size > len(self.tracepath):
+            return None
+        return bytes(self.tracepath[start:start + size])
 
     def __str__(self):
         s = super().__str__()
@@ -1378,7 +1413,8 @@ class MC_Trace_Out(MC_Outgoing):
         Parameters:
         * tag - 4-byte tag for this trace
         * auth - 4-byte auth code
-        * flags - not sure what is set here, Meshcore doesn't seem to use it
+        * flags - low two bits are the path-hash SHIFT: entries in `path` are
+          `1 << (flags & 3)` bytes each (1, 2, 4 or 8). The rest is reserved.
         """
         # Create a packet, direct, 0 hop
         super().__init__(self.TYPE_TRACE, path=[])
@@ -1416,9 +1452,14 @@ class MC_Trace_Out(MC_Outgoing):
         # Can't call it self.path, that's the packet's path in the header (which, for
         # a TRACE, is a zero-hop direct path)
         self.tracepath = bytes(path)
+        # Entries are `1 << (flags & 3)` bytes wide; the route must be a whole number of
+        # them, or the far end walks it misaligned.
+        entry = 1 << (self.flags[0] & 0x03)
+        if len(self.tracepath) % entry:
+            raise ValueError("Trace path is not a whole number of hops")
         if len(self.tracepath) < 1:
             raise ValueError("Path is too short")
-        if len(self.tracepath) > 64:
+        if len(self.tracepath) > self.MAX_PATH_SIZE:
             raise ValueError("Path is too long")
         
     # Trace payload consists of

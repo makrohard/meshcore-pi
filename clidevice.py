@@ -385,7 +385,9 @@ class CLIDevice(BasicMesh):
             # Return a PATH packet with the response
             timestamp = struct.pack("<L", unique_time())
 
-            response = packet.MC_Path_Out(self.me, dest, rx_packet.path, response=timestamp+data)
+            response = packet.MC_Path_Out(self.me, dest, rx_packet.path,
+                                          response=timestamp+data,
+                                          path_hash_size=rx_packet.path_hash_size)
         else:
             # Packet came direct, no need to tell the sender how to get here
             response = packet.MC_Response_Out(self.me, dest, data)
@@ -410,7 +412,9 @@ class CLIDevice(BasicMesh):
                 # Return a PATH packet with the response
                 ts = struct.pack("<L", rx_packet.timestamp)
 
-                response = packet.MC_Path_Out(self.me, rx_packet.source, rx_packet.path, response=ts+data)
+                response = packet.MC_Path_Out(self.me, rx_packet.source, rx_packet.path,
+                                              response=ts+data,
+                                              path_hash_size=rx_packet.path_hash_size)
             else:
                 # Packet came direct, no need to tell the sender how to get here
                 response = packet.MC_Response_Out(self.me, rx_packet.source, data, rx_packet.timestamp)

@@ -195,7 +195,9 @@ class BasicMesh:
                                               path_hash_size=rx_packet.path_hash_size)
                 logger.debug("Responding to flood message with PATH+ACK")
             else:
-                path_ack = packet.MC_Ack_Outgoing(rx_packet, rx_packet.source.path)
+                path_ack = packet.MC_Ack_Outgoing(
+                    rx_packet, rx_packet.source.path,
+                    path_hash_size=getattr(rx_packet.source, "path_hash_size", 1))
                 logger.debug("Responding to direct message with ACK")
 
         # FIXME - do we need a delay? Try this delay thing - 200ms

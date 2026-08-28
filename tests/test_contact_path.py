@@ -193,3 +193,73 @@ class DirectTxUsesTheLearnedSizeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class OutboundAbstractionTests(unittest.TestCase):
+    """AUDIT-FOUND: the size must arrive WITH the path at MC_Outgoing, not be patched on
+    afterwards. Two outbound paths bypassed the abstraction and reverted to 1-byte hops,
+    and validation ran before the size was known."""
+
+    def _pair(self):
+        from ed25519_wrapper import ED25519_Wrapper
+        from identity import AdvertData, AdvertType, Identity, SelfIdentity
+        me = SelfIdentity(private_key=ED25519_Wrapper(), name=b"me", latlon=None,
+                          devicetype=AdvertType.CHAT)
+        peer = SelfIdentity(private_key=ED25519_Wrapper(), name=b"peer", latlon=None,
+                            devicetype=AdvertType.CHAT)
+        dest = Identity(AdvertData(peer.data), bytearray(b'\xaa\xbb\xcc\xdd'),
+                        path_hash_size=2)
+        dest.create_shared_secret(me.private_key)
+        return me, dest
+
+    def test_a_full_length_multi_byte_route_is_not_rejected(self):
+        """32 hops x 2 bytes = 64 = MAX_PATH_SIZE. Validating before the size was applied
+        made this look like 64 one-byte hops and refused it."""
+        import packet
+        p = packet.MC_Outgoing(packet.MC_Packet.TYPE_RAW_CUSTOM,
+                               bytearray(b'\x5a' * 64), path_hash_size=2)
+        self.assertEqual(p.pathlen, 32)
+        self.assertEqual(p.encoded_pathlen, ((2 - 1) << 6) | 32)
+
+    def test_too_many_hops_is_still_rejected(self):
+        import packet
+        with self.assertRaises(ValueError):
+            packet.MC_Outgoing(packet.MC_Packet.TYPE_RAW_CUSTOM,
+                               bytearray(b'\x01' * 64), path_hash_size=1)   # 64 hops > 63
+
+    def test_a_path_longer_than_max_path_size_is_rejected(self):
+        import packet
+        with self.assertRaises(ValueError):
+            packet.MC_Outgoing(packet.MC_Packet.TYPE_RAW_CUSTOM,
+                               bytearray(b'\x01' * 66), path_hash_size=2)
+
+    def test_an_ack_replies_over_the_route_it_arrived_on(self):
+        """A direct message received over a learned 2-byte route must be ACKed over that
+        same route — not re-encoded as twice as many one-byte hops."""
+        import packet
+        me, dest = self._pair()
+        text = packet.MC_Text_Out(me, dest, b"hi")
+        ack = packet.MC_Ack_Outgoing(text, dest.path, path_hash_size=dest.path_hash_size)
+        self.assertEqual(ack.path_hash_size, 2)
+        self.assertEqual(ack.pathlen, 2)
+        self.assertEqual(ack.encoded_pathlen, ((2 - 1) << 6) | 2)
+
+    def test_an_anonymous_request_inherits_the_destination_size(self):
+        import packet
+        me, dest = self._pair()
+        req = packet.MC_AnonReq_Out(me, dest, b"")
+        self.assertEqual(req.path_hash_size, 2)
+        self.assertEqual(req.pathlen, 2)
+
+    def test_every_contact_derived_direct_packet_carries_the_size(self):
+        """Sweep the outbound types that take a destination contact."""
+        import packet
+        me, dest = self._pair()
+        for name, p in (
+            ("text", packet.MC_Text_Out(me, dest, b"hi")),
+            ("request", packet.MC_Req_Out(me, dest, 0x01, b"")),
+            ("anonreq", packet.MC_AnonReq_Out(me, dest, b"")),
+        ):
+            with self.subTest(name):
+                self.assertEqual(p.path_hash_size, 2, name)
+                self.assertEqual(p.pathlen, 2, name)

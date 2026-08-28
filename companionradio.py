@@ -660,7 +660,7 @@ class CompanionRadio(BasicMesh):
     async def rx_trace(self, rx_packet:packet.MC_Trace):
         logger.debug(f"Received Trace, tag {hexlify(rx_packet.tag).decode()}, {len(rx_packet.tracepath)} hops, {len(rx_packet.path)} results")
 
-        if len(rx_packet.tracepath) != len(rx_packet.path):
+        if not rx_packet.trace_completed:
             logger.debug("Incomplete trace, ignoring")
             return
 
@@ -678,7 +678,9 @@ class CompanionRadio(BasicMesh):
         # It's possible this is someone else's trace. In which case, the tag won't match and the client
         # should discard it
 
-        msg = bytes([PUSH_CODE_TRACE_DATA, 0, len(rx_packet.path), rx_packet.flags]) + rx_packet.tag + rx_packet.auth
+        # Hop count, not byte count — they differ once entries are wider than one byte.
+        msg = (bytes([PUSH_CODE_TRACE_DATA, 0, rx_packet.trace_hops, rx_packet.flags])
+               + rx_packet.tag + rx_packet.auth)
 
         # Path hashes
         msg += rx_packet.tracepath
