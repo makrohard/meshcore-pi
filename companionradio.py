@@ -128,6 +128,9 @@ PUSH_CODE_TELEMETRY_RESPONSE = 0x8B
 # explicit "not applicable" while still showing as full rather than as a dying node.
 BATTERY_NOT_APPLICABLE_MV = 0xffff
 
+# A contact whose route is unknown: flood to reach it. Upstream OUT_PATH_UNKNOWN.
+OUT_PATH_UNKNOWN = 0xff
+
 ERR_CODE_UNSUPPORTED_CMD = 1
 ERR_CODE_NOT_FOUND = 2
 ERR_CODE_TABLE_FULL = 3
@@ -369,13 +372,24 @@ class CompanionRadio(BasicMesh):
         """
         # Response code, public key
         contactresponse = bytes([responsecode]) + contact.pubkey
-        # Type (Chat, repeater, etc), flags, out path length
+        # Type (Chat, repeater, etc), flags, out path length.
+        #
+        # `out_path_len` is the ENCODED byte current MeshCore uses everywhere:
+        # (hash_size-1)<<6 | hop_count, with OUT_PATH_UNKNOWN (0xff) meaning "no route
+        # known, flood it". Sending a bare hop count made a 2- or 3-byte-hash route decode
+        # as that many single-byte hops in the client, and sending 0 for an unknown route
+        # claimed a zero-hop direct path to a node we have never reached.
         if contact.path is None:
             path = bytes()
+            out_path_len = OUT_PATH_UNKNOWN
         else:
             path = contact.path
-        contactresponse += struct.pack("<BBB", contact.advert.adv_type.value, contact.advert.adv_flags.value, len(path))
-        # Path, padded to 64 bytes
+            size = getattr(contact, "path_hash_size", 1) or 1
+            out_path_len = ((size - 1) << 6) | (len(path) // size)
+        contactresponse += struct.pack("<BBB", contact.advert.adv_type.value,
+                                       contact.advert.adv_flags.value, out_path_len)
+        # Path, in a FIXED 64-byte field (MAX_PATH_SIZE) — the client reads exactly that
+        # many bytes regardless of how many hops are in use.
         contactresponse += pad(path, 64)
         # Advert name, padded to 32 bytes
         contactresponse += pad(contact.name, 32)
@@ -428,12 +442,22 @@ class CompanionRadio(BasicMesh):
         pubkey = contactdata[0:32]
         type = contactdata[32]
         flags = contactdata[33]
-        pathlen = contactdata[34]
+        # The path field is a FIXED 64 bytes (MAX_PATH_SIZE), whatever the hop count —
+        # consuming only `pathlen` bytes desynchronised every field after it (name,
+        # timestamps, position) for any contact with a path shorter than 64 bytes.
+        out_path_len = contactdata[34]
+        if out_path_len == OUT_PATH_UNKNOWN:
+            path, path_hash_size = None, 1        # no route known: flood
+        else:
+            try:
+                path_hash_size, _count, pathbytes = packet.MC_Packet.decode_pathlen(
+                    out_path_len)
+            except InvalidMeshcorePacket:
+                return ERR(ERR_CODE_ILLEGAL_ARG)
+            # If the hop count is 0 (ie, direct, zero-hop), path will be b''
+            path = contactdata[35:35 + pathbytes]
 
-        # If pathlen is 0 (ie, direct, zero-hop), path will be [] (as a bytes object, ie b'')
-        path = contactdata[35:35+pathlen]
-
-        rest = contactdata[35+pathlen:]
+        rest = contactdata[35 + packet.MC_Packet.MAX_PATH_SIZE:]
         name = rest[0:32].rstrip(b'\x00')
         last_advert_time = struct.unpack("<L", rest[32:36])[0]
 
@@ -455,6 +479,7 @@ class CompanionRadio(BasicMesh):
             # FIXME: do the rest of it too
 
             contact.path = path
+            contact.path_hash_size = path_hash_size
             # Update the contact in the store
             self.ids.add_identity(contact)
 
@@ -861,24 +886,20 @@ class CompanionRadio(BasicMesh):
                     await self.transmit_packet(advert)
                     response = OK
 
-            elif command == CMD_SET_RADIO_PARAMS:
-                logger.debug(f"CMD_SET_RADIO_PARAMS, {hexlify(frame[1:]).decode()}")
-
-                # FIXME - don't just ignore this
-                response = OK
-
-            elif command == CMD_SET_RADIO_TX_POWER:
-                logger.debug(f"CMD_SET_RADIO_TX_POWER, {hexlify(frame[1:]).decode()}")
-
-                # FIXME - don't just ignore this
-                response = OK
-
-
-            elif command == CMD_SET_OTHER_PARAMS:
-                logger.debug(f"CMD_SET_OTHER_PARAMS, {hexlify(frame[1:]).decode()}")
-
-                # FIXME - don't just ignore this
-                response = OK
+            elif command in (CMD_SET_RADIO_PARAMS, CMD_SET_RADIO_TX_POWER,
+                             CMD_SET_OTHER_PARAMS):
+                # NOT SUPPORTED — and say so. These used to answer OK while doing nothing,
+                # which told a client its frequency, power or settings change had taken
+                # effect when the radio had not moved at all: the worst kind of answer,
+                # because the operator has no way to notice.
+                #
+                # This node does not own the radio. It reaches it through the LoRaHAM
+                # daemon, whose parameters are set by the controller that owns the band —
+                # app-side reconfiguration would fight that owner. An honest refusal lets
+                # the client show the setting as unavailable instead of silently wrong.
+                logger.info(f"Refusing radio reconfiguration command {command}: "
+                            f"this node does not own the radio")
+                response = ERR(ERR_CODE_UNSUPPORTED_CMD)
 
 
             elif command == CMD_SYNC_NEXT_MESSAGE:

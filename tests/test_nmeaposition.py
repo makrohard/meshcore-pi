@@ -255,3 +255,31 @@ class PtyEndpointTests(unittest.TestCase):
 if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG)
     unittest.main()
+
+
+class HemisphereTests(unittest.TestCase):
+    """AUDIT-FOUND: anything that was not S/W was treated as positive, so a checksum-valid
+    but malformed sentence could yield a confident position in the wrong hemisphere."""
+
+    def test_an_invalid_hemisphere_letter_is_not_a_position(self):
+        for lat_h, lon_h in (("X", "W"), ("N", "Q"), ("E", "W"), ("N", "S"), ("", "W")):
+            s = nmea(f"$GPGGA,123519,5128.6640,{lat_h},00000.0900,{lon_h},"
+                     f"1,08,0.9,545.4,M,46.9,M,,")
+            with self.subTest(lat_h=lat_h, lon_h=lon_h):
+                self.assertIsNone(parse_position(s), s)
+
+    def test_latitude_only_accepts_n_or_s_and_longitude_e_or_w(self):
+        for lat_h, sign in (("N", 1), ("S", -1)):
+            got = parse_position(nmea(
+                f"$GPGGA,123519,5128.6640,{lat_h},00000.0900,W,1,08,0.9,545.4,M,46.9,M,,"))
+            self.assertIsNotNone(got)
+            self.assertEqual(got[0] > 0, sign > 0)
+        for lon_h, sign in (("E", 1), ("W", -1)):
+            got = parse_position(nmea(
+                f"$GPGGA,123519,5128.6640,N,00100.0900,{lon_h},1,08,0.9,545.4,M,46.9,M,,"))
+            self.assertIsNotNone(got)
+            self.assertEqual(got[1] > 0, sign > 0)
+
+    def test_lowercase_hemispheres_are_accepted(self):
+        self.assertIsNotNone(parse_position(nmea(
+            "$GPGGA,123519,5128.6640,n,00000.0900,w,1,08,0.9,545.4,M,46.9,M,,")))

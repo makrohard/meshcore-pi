@@ -217,6 +217,10 @@ class Destination:
     def __init__(self):
         # Flood
         self.path = None
+        # Bytes per hop in `path`. Current MeshCore encodes the path length as
+        # (hash_size-1)<<6 | hop_count, so a path is meaningless without its size: storing
+        # the bytes alone made every learned route revert to 1-byte hops on the next send.
+        self.path_hash_size = 1
         self._sharedsecret = None
         self._pubkey = None
 
@@ -285,13 +289,14 @@ class Identity(Destination):
     """
 
     # Public key and timestamp are required
-    def __init__(self, advert:AdvertData, path=None, advertpath=None):
+    def __init__(self, advert:AdvertData, path=None, advertpath=None, path_hash_size=1):
         super().__init__()
 
         self.advert = advert
 
         # None = Flood, [] = direct, [ x, y, z ... ] = path
         self.path = path
+        self.path_hash_size = path_hash_size
         # How their advert got to us - this isn't useful for sending, it's just interesting
         self.advertpath = advertpath
         # When their advert arrived (irrespective of advert timestamp, which could be wrong)
@@ -540,15 +545,27 @@ class FileIdentityStore(IdentityStore):
                     since = snr[0].rstrip().split('@')
                     fields = since[0].rstrip().split('/')
                     data = unhexlify(fields[0])
+                    path_hash_size = 1
                     if len(fields) >= 2:
-                        path = bytearray(unhexlify(fields[1]))
+                        # Optional "*<size>" suffix records the bytes-per-hop the path was
+                        # learned with. Absent means 1, so files written before multi-byte
+                        # hashes existed load unchanged.
+                        pathhex = fields[1]
+                        if '*' in pathhex:
+                            pathhex, _, sizetxt = pathhex.partition('*')
+                            try:
+                                path_hash_size = max(1, min(3, int(sizetxt)))
+                            except ValueError:
+                                path_hash_size = 1
+                        path = bytearray(unhexlify(pathhex))
                     else:
                         path = None
                     if len(fields) >= 3:
                         advertpath = bytearray(unhexlify(fields[2]))
                     else:
                         advertpath = None
-                    id = Identity(AdvertData(data), path, advertpath)
+                    id = Identity(AdvertData(data), path, advertpath,
+                                  path_hash_size=path_hash_size)
                     id.create_shared_secret(selfidentity)
 
                     if len(since) >= 2:
@@ -572,7 +589,9 @@ class FileIdentityStore(IdentityStore):
                 print('#', id.name, file=f)
                 print(hexlify(id.advert.data).decode('utf-8'), file=f, end='')
                 if id.path is not None:
-                    print(f"/{hexlify(id.path).decode('utf-8')}", file=f, end='')
+                    size = getattr(id, "path_hash_size", 1) or 1
+                    suffix = '' if size == 1 else f"*{size}"
+                    print(f"/{hexlify(id.path).decode('utf-8')}{suffix}", file=f, end='')
                     if id.advertpath is not None:
                         print(f"/{hexlify(id.advertpath).decode('utf-8')}", file=f, end='')
                 if id.lastmsgtime > 0:

@@ -225,3 +225,40 @@ class DisconnectTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class MidFrameTimeoutTests(unittest.TestCase):
+    """AUDIT-FOUND: once '<' is accepted the frame boundary is committed. A timeout part
+    way through the header or body means we no longer know where the next frame starts, so
+    continuing on the same connection can read leftover payload — including a '<' inside
+    it — as framing, and stay desynchronised indefinitely."""
+
+    def test_a_timeout_reading_the_header_drops_the_connection(self):
+        iface = _iface()
+        iface._reader = _FakeReader([b'<\x05'])        # start + 1 of 2 length bytes, then quiet
+
+        async def go():
+            task = asyncio.create_task(iface.rx())
+            await asyncio.sleep(1.4)                   # past _FRAME_HEADER_TIMEOUT
+            done = iface._writer is None
+            task.cancel()
+            return done
+
+        self.assertTrue(_run(go(), timeout=5.0))
+        self.assertIsNone(iface._reader)
+        self.assertFalse(iface._connected.is_set())
+
+    def test_a_timeout_reading_the_body_drops_the_connection(self):
+        iface = _iface()
+        # Announces 10 bytes, delivers 2, then goes quiet.
+        iface._reader = _FakeReader([b'<' + (10).to_bytes(2, 'little') + b'ab'])
+        writer = iface._writer
+
+        async def go():
+            task = asyncio.create_task(iface.rx())
+            await asyncio.sleep(5.5)                   # past _FRAME_BODY_TIMEOUT
+            task.cancel()
+            return writer.closed
+
+        self.assertTrue(_run(go(), timeout=9.0))
+        self.assertIsNone(iface._writer)

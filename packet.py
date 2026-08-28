@@ -824,6 +824,10 @@ class MC_SrcDest_Out(MC_Outgoing):
         path = dest.path
 
         super().__init__(type, path)
+        # The route was learned with a specific bytes-per-hop; re-encoding it as 1-byte
+        # hops would put a different (and wrong) hop count on the wire.
+        if path is not None:
+            self.path_hash_size = getattr(dest, "path_hash_size", 1) or 1
         self.src = src
         self.srchash = src.hash
         self.destination = dest

@@ -69,13 +69,22 @@ def nmea_checksum_ok(line):
     return got == want
 
 
-def _degrees(value, hemisphere):
+def _degrees(value, hemisphere, allowed):
     """NMEA ddmm.mmmm + hemisphere -> signed decimal degrees, or None.
 
     An empty field is the normal way a receiver says "no position yet", so it is not an
     error — it simply is not a fix.
+
+    `allowed` is the pair of hemisphere letters legal for this axis (N/S for latitude,
+    E/W for longitude). Anything else is rejected rather than assumed positive: a
+    checksum-valid but malformed sentence must not become a plausible-looking position on
+    the wrong side of the equator or the meridian.
     """
     if not value or not hemisphere:
+        return None
+    h = hemisphere.decode("ascii", "ignore").upper() if isinstance(hemisphere, bytes) \
+        else str(hemisphere).upper()
+    if h not in allowed:
         return None
     try:
         raw = float(value)
@@ -86,7 +95,7 @@ def _degrees(value, hemisphere):
     if minutes >= 60.0:
         return None
     out = degrees + minutes / 60.0
-    if hemisphere in (b'S', b'W', 'S', 'W'):
+    if h in ('S', 'W'):
         out = -out
     return out
 
@@ -127,8 +136,8 @@ def parse_position(line):
 
     if lat_i + 3 >= len(fields):
         return None
-    lat = _degrees(fields[lat_i], fields[lat_i + 1])
-    lon = _degrees(fields[lat_i + 2], fields[lat_i + 3])
+    lat = _degrees(fields[lat_i], fields[lat_i + 1], ('N', 'S'))
+    lon = _degrees(fields[lat_i + 2], fields[lat_i + 3], ('E', 'W'))
     if lat is None or lon is None:
         return None
     if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):

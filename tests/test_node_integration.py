@@ -298,5 +298,23 @@ class NodeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp[0], cr.RESP_CODE_DEVICE_INFO)
 
 
+
+    async def test_radio_reconfiguration_is_refused_not_faked(self):
+        """AUDIT-FOUND: these answered OK while doing nothing, telling a client its
+        frequency/power/settings change had taken effect when the radio had not moved.
+        This node reaches the radio through the LoRaHAM daemon and does not own it, so the
+        honest answer is "unsupported"."""
+        client = await self._start()
+        for cmd, name in ((cr.CMD_SET_RADIO_PARAMS, "SET_RADIO_PARAMS"),
+                          (cr.CMD_SET_RADIO_TX_POWER, "SET_RADIO_TX_POWER"),
+                          (cr.CMD_SET_OTHER_PARAMS, "SET_OTHER_PARAMS")):
+            resp = await client.request(bytes([cmd]) + b'\x00' * 8)
+            self.assertEqual(resp[0], cr.RESP_CODE_ERR, name)
+            self.assertEqual(resp[1], cr.ERR_CODE_UNSUPPORTED_CMD, name)
+        # and the node is still serving
+        resp = await client.request(bytes([cr.CMD_DEVICE_QUERY, 3]))
+        self.assertEqual(resp[0], cr.RESP_CODE_DEVICE_INFO)
+
+
 if __name__ == '__main__':
     unittest.main()

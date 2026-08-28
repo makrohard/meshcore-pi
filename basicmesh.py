@@ -305,6 +305,9 @@ class BasicMesh:
                 logger.debug(f"Received path from {receivedpacket.source.name}: {pathstr(receivedpacket.pathdata)}")
                 id = receivedpacket.source
                 id.path = receivedpacket.pathdata
+                # Keep the hash size the path was encoded with; without it the next direct
+                # send re-encodes these bytes as 1-byte hops and routes nowhere.
+                id.path_hash_size = receivedpacket.path_hash_size
                 self.ids.add_identity(id)
                 # Callback to UI update path?
 

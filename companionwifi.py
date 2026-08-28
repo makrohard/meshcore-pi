@@ -194,7 +194,16 @@ class CompanionInterface(BaseCompanionInterface):
                         return r
 
                     except TimeoutError:
-                        logger.warning("Timed out waiting frame")
+                        # The frame START was accepted, so the boundary is already known —
+                        # and a partially delivered header/body means we no longer know
+                        # where the next frame begins. Continuing on the same connection
+                        # would let leftover header/body bytes (possibly a '<' inside a
+                        # payload) be read as framing, staying desynchronised indefinitely.
+                        # Drop it; the client reconnects and both sides resynchronise.
+                        logger.warning("Timed out mid-frame — dropping the connection to "
+                                       "resynchronise")
+                        self._reset_connection(close=True)
+                        break
             except asyncio.exceptions.IncompleteReadError:
                 # The connection was lost
                 logger.info("Connection to Meshcore app lost")
