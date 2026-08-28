@@ -139,5 +139,36 @@ class TransportForwardTests(unittest.TestCase):
         self.assertEqual(out.payload, b'\x42')
 
 
+
+
+class PathReplyTests(unittest.TestCase):
+    """A PATH reply carries a path in the same encoded form as the packet header.
+
+    The parser used to slice `[0:pathlen]` — including the length byte and dropping the
+    last hop — so every path learned from a PATH reply was corrupt: the first hop became
+    the hop count, and direct routing then addressed a node that was never on the route.
+    """
+
+    def test_encoded_path_length_round_trips(self):
+        """Encode with MC_Path_Out's rule, decode with the packet decoder."""
+        from packet import MC_Packet
+        for size in (1, 2, 3):
+            for count in (0, 1, 5, 20):
+                enc = ((size - 1) << 6) | count
+                got_size, got_count, bytelen = MC_Packet.decode_pathlen(enc)
+                self.assertEqual((got_size, got_count), (size, count))
+                self.assertEqual(bytelen, count * size)
+
+    def test_path_payload_slice_skips_the_length_byte(self):
+        """The off-by-one itself: path starts AFTER the length byte."""
+        from packet import MC_Packet
+        payload = bytes([((1 - 1) << 6) | 3]) + b'\xaa\xbb\xcc' + b'\x00'
+        size, count, bytelen = MC_Packet.decode_pathlen(payload[0])
+        self.assertEqual((size, count, bytelen), (1, 3, 3))
+        self.assertEqual(payload[1:1 + bytelen], b'\xaa\xbb\xcc')
+        # The old slice produced this instead — length byte in, last hop lost:
+        self.assertEqual(payload[0:3], b'\x03\xaa\xbb')
+
+
 if __name__ == '__main__':
     unittest.main()

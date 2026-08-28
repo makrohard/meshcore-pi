@@ -268,5 +268,35 @@ class NodeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp[0], cr.RESP_CODE_DEVICE_INFO)
 
 
+    # --- findings from the P0-P2 self-audit, proven against the real stack -------------
+
+    async def test_a_frame_hitting_an_error_path_that_itself_raises_is_survived(self):
+        """P1: the malformed-frame guard listed the exception types it expected. Three
+        handlers' ERROR paths raised AttributeError/TypeError (logger typos), which the
+        guard missed — and `run()` is a TaskGroup child, so the whole process died. Worse
+        than the `break` it replaced."""
+        client = await self._start()
+
+        # CMD_SEND_TRACE_PATH (36) shorter than 10 bytes -> hits the short-frame error path.
+        resp = await client.request(bytes([cr.CMD_SEND_TRACE_PATH, 1, 2]))
+        self.assertEqual(resp[0], cr.RESP_CODE_ERR)
+
+        # CMD_SET_ADVERT_LATLON (14) with out-of-range values -> the other typo'd path.
+        resp = await client.request(
+            bytes([cr.CMD_SET_ADVERT_LATLON]) + struct.pack("<ll", 99_000_000, 0))
+        self.assertEqual(resp[0], cr.RESP_CODE_ERR)
+
+        # Still alive and serving.
+        resp = await client.request(bytes([cr.CMD_DEVICE_QUERY, 3]))
+        self.assertEqual(resp[0], cr.RESP_CODE_DEVICE_INFO)
+
+    async def test_an_oversized_advert_name_does_not_kill_the_node(self):
+        client = await self._start()
+        resp = await client.request(bytes([cr.CMD_SET_ADVERT_NAME]) + b'x' * 200)
+        self.assertEqual(resp[0], cr.RESP_CODE_ERR)
+        resp = await client.request(bytes([cr.CMD_DEVICE_QUERY, 3]))
+        self.assertEqual(resp[0], cr.RESP_CODE_DEVICE_INFO)
+
+
 if __name__ == '__main__':
     unittest.main()

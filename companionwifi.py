@@ -198,14 +198,14 @@ class CompanionInterface(BaseCompanionInterface):
             except asyncio.exceptions.IncompleteReadError:
                 # The connection was lost
                 logger.info("Connection to Meshcore app lost")
-                self._reset_connection()
+                self._reset_connection(close=True)
             except TimeoutError:
                 # Idle timeout (only reachable when one is configured)
                 logger.info("Connection to Meshcore app timed out")
                 self._reset_connection(close=True)
             except Exception as e:
                 logger.error(f"Connection lost due to: {repr(e)}")
-                self._reset_connection()
+                self._reset_connection(close=True)
 
     async def _resync(self, first):
         """Consume bytes until a start-of-frame '<'. True when one was found.
@@ -235,9 +235,15 @@ class CompanionInterface(BaseCompanionInterface):
                 return True
             junkdata += r
 
-    def _reset_connection(self, close=False):
+    def _reset_connection(self, close=True):
         """Drop reader AND writer together, so a stale reader can never be used against a
-        connection we have already given up on."""
+        connection we have already given up on.
+
+        ALWAYS close the transport by default: a peer that hangs up leaves the socket in
+        CLOSE_WAIT until the writer is closed, and asyncio keeps the transport alive after
+        EOF, so a client that reconnects (a phone changing network) leaked a descriptor per
+        cycle.
+        """
         if close and self._writer is not None:
             try:
                 self._writer.close()

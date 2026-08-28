@@ -77,11 +77,19 @@ class AdvertData(AdvertBase):
         # Data always appears in the order of latlon, battery, temperature, name
         start = 1
         if self._adv_flags & AdvertDataFlags.LATLON:
-            self._latlon = self._advert[start:start + 8]    
+            self._latlon = self._advert[start:start + 8]
             start += 8
 
             # Unpack the latlon data
             # Each is a 4-byte signed integer, containing the lat/lon in microdegrees
+            #
+            # A flags byte can CLAIM latlon while the sentence carries no such bytes. The
+            # slice above then comes back short and `unpack` raises `struct.error`, which
+            # is not an InvalidPacket — so it escaped the RX loop, failed the mesh task and
+            # took the whole process down. Anything transmitting on the frequency could do
+            # it, unauthenticated, before the advert's signature was ever checked.
+            if len(self._latlon) != 8:
+                raise InvalidMeshcorePacket("Advert claims a position but carries none")
             (lat,lon) = struct.unpack("<ll", self._latlon)
 
             # Convert to degrees

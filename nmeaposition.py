@@ -205,8 +205,9 @@ class NMEAPosition:
 
         delay = _RECONNECT_MIN
         while stop is None or not stop.is_set():
+            writer = None
             try:
-                reader, _writer = await serial_asyncio.open_serial_connection(
+                reader, writer = await serial_asyncio.open_serial_connection(
                     url=self.device, baudrate=self.baud)
                 logger.info("NMEA position source connected")
                 delay = _RECONNECT_MIN
@@ -226,6 +227,18 @@ class NMEAPosition:
                 # the device path, which is fine, but keep it terse.
                 logger.warning("NMEA position source unavailable (%s); retrying",
                                type(e).__name__)
+            finally:
+                # CLOSE THE TRANSPORT on every exit from the read loop. Dropping the writer
+                # left the serial transport registered with the event loop, so it was never
+                # collected: an endpoint that opens then EOFs (a PTY whose feeder exited)
+                # reconnects once a second and leaks a descriptor each time, exhausting the
+                # process's file descriptors within the hour — taking the radio interfaces
+                # down with it.
+                if writer is not None:
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
             self._expire()
             try:
                 await asyncio.wait_for(

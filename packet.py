@@ -322,7 +322,11 @@ class MC_Packet:
         s = f"Packet class: {self.__class__.__name__}\nPacket Length: {len(self)}\n"
         s += f"Route: {self.routename}, Path Length: {self.pathlen}"
         if self.pathlen:
-            s += ", path: " + ",".join( (f"{hop:02x}" for hop in self.path[0:self.pathlen]) ) 
+            # Slice by BYTES (count * size), not by count — with multi-byte hashes the
+            # latter printed a truncated path and split each hop into separate bytes.
+            size = self.path_hash_size
+            hops = [self.path[i:i + size] for i in range(0, self.pathlen * size, size)]
+            s += ", path: " + ",".join(h.hex() for h in hops)
         s += "\n"
         return s
 
@@ -715,13 +719,22 @@ class MC_Path(MC_SrcDest):
         self.response = None
 
         if self.packetdata is not None:
-            pathlen = self.packetdata[0]
-            # If pathlen = 0 (direct), pathdata = []
-            self.pathdata = self.packetdata[0:pathlen]
+            # The PATH payload carries a path in the SAME encoded form as the packet header:
+            # (hash_size-1)<<6 | hash_count, occupying count*size bytes AFTER the length
+            # byte. (`mesh::Mesh` reads `path_len = data[k++]` then `path = &data[k]`.)
+            #
+            # This used to slice `[0:pathlen]` — including the length byte and dropping the
+            # last hop — so every path learned from a PATH reply was corrupt: the first hop
+            # became the hop count and direct routing then addressed a node that was never
+            # on the route. A 1-hop path decoded to just its length byte.
+            self.path_hash_size, _count, pathbytes = MC_Packet.decode_pathlen(
+                self.packetdata[0])
+            # If the path is empty (direct), pathdata = []
+            self.pathdata = self.packetdata[1:1 + pathbytes]
 
             self.extra_type = None
             # Gather up anything left after the path
-            extra = self.packetdata[pathlen+1:]
+            extra = self.packetdata[1 + pathbytes:]
 
             # If there is more data, and the first byte is not 0 (because the unencrypted data is zero padded)
             # or 0xff (indicates the remaining data is just random filler)
@@ -917,8 +930,11 @@ class MC_Path_Out(MC_SrcDest_Out):
     * returnpath - path to send (ie, the path the inbound flood packet arrived on)
     * ackhash - optional ack hash for a received message
     * response - optional response to req/anonreq
+    * path_hash_size - bytes per hop in `returnpath` (1 for all legacy traffic); must match
+      the packet the path was learned from, or the receiver decodes the wrong hop count
     """
-    def __init__(self, src, dest, returnpath, ackhash=None, response=None):
+    def __init__(self, src, dest, returnpath, ackhash=None, response=None,
+                 path_hash_size=1):
         super().__init__(src, dest, self.TYPE_PATH)
         
         # Save these values in case we want to print the packet
@@ -926,7 +942,11 @@ class MC_Path_Out(MC_SrcDest_Out):
         self.ackhash = ackhash
         self.response = response
 
-        self.data = bytes([len(returnpath)]) + returnpath
+        # Encode the path length the way the receiver decodes it: hash size in the top two
+        # bits, hop count in the low six. Writing a bare byte count made a multi-byte-hash
+        # path decode as that many single-byte hops on the far side.
+        self.data = bytes([((path_hash_size - 1) << 6) | (len(returnpath) // path_hash_size)])
+        self.data += returnpath
 
         if ackhash is not None:
             self.data += bytes([self.TYPE_ACK]) + ackhash

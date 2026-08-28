@@ -180,7 +180,8 @@ class BasicMesh:
             # See BaseChatMesh::onPeerDataRecv in Meshcore
             if rx_packet.is_flood():
                 # If the packet is flooded to us, respond with a PATH (without the ACK)
-                path_ack = packet.MC_Path_Out(self.me, rx_packet.source, rx_packet.path)
+                path_ack = packet.MC_Path_Out(self.me, rx_packet.source, rx_packet.path,
+                                              path_hash_size=rx_packet.path_hash_size)
                 logger.debug("Responding to flood CLI_DATA message with PATH")
             else:
                 logger.debug("Direct CLI_DATA message, no response")
@@ -190,7 +191,8 @@ class BasicMesh:
             ackhash = rx_packet.message_ackhash()
 
             if rx_packet.is_flood():
-                path_ack = packet.MC_Path_Out(self.me, rx_packet.source, rx_packet.path, ackhash)
+                path_ack = packet.MC_Path_Out(self.me, rx_packet.source, rx_packet.path, ackhash,
+                                              path_hash_size=rx_packet.path_hash_size)
                 logger.debug("Responding to flood message with PATH+ACK")
             else:
                 path_ack = packet.MC_Ack_Outgoing(rx_packet, rx_packet.source.path)
@@ -260,6 +262,16 @@ class BasicMesh:
 
             except InvalidPacket as e:
                 logger.warning(f"Bad packet: {e.args}")
+                self.stats["badpacket"] += 1
+                continue
+            except Exception as e:
+                # DEFENCE IN DEPTH. Packets arrive from anyone transmitting on the
+                # frequency, and a parser that raises anything other than InvalidPacket
+                # used to escape this loop, fail the mesh task and terminate the process —
+                # a remote, unauthenticated kill. A packet we cannot parse is a bad packet,
+                # whatever the parser called the failure.
+                # `asyncio.CancelledError` is a BaseException, so shutdown still works.
+                logger.warning(f"Bad packet ({type(e).__name__}): {e.args}")
                 self.stats["badpacket"] += 1
                 continue
 

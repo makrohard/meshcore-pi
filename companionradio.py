@@ -684,12 +684,15 @@ class CompanionRadio(BasicMesh):
             logger.debug(f"Command received: {command}, frame = {hexlify(frame).decode()}, length = {len(frame )}")
 
             try:
-              response = await self._handle_command(command, frame)
-            except (IndexError, struct.error, ValueError, UnicodeDecodeError) as e:
+                response = await self._handle_command(command, frame)
+            except Exception as e:
                 # A TRUNCATED OR MALFORMED frame must not take the node down. Handlers index
                 # their arguments directly, so a short frame used to raise straight out of
-                # this loop and end command processing for the life of the process — a
-                # denial of service from one bad frame.
+                # this loop, and `run()` is a TaskGroup child — the whole process went with
+                # it. Catch EVERYTHING: enumerating the exception types a hundred handlers
+                # can raise is a guess, and this guard was already wrong about three of them
+                # (an error path that itself raised AttributeError/TypeError).
+                # `asyncio.CancelledError` is a BaseException, so shutdown still works.
                 logger.warning(f"Malformed frame for command {command}: {type(e).__name__}")
                 response = ERR(ERR_CODE_ILLEGAL_ARG)
 
@@ -795,7 +798,7 @@ class CompanionRadio(BasicMesh):
                     self.me.name = name
                     response = OK
                 except ValueError as e:
-                    logger(f"Name change rejected: {repr(e)}")
+                    logger.error(f"Name change rejected: {repr(e)}")
                     response = ERR(ERR_CODE_ILLEGAL_ARG)
 
             elif command == CMD_ADD_UPDATE_CONTACT:
@@ -831,7 +834,7 @@ class CompanionRadio(BasicMesh):
                     self.me.latlon = validate_latlon(f_lat, f_lon)
                     response = OK
                 except ValueError as e:
-                    logger(f"Lat/lon change rejected: {repr(e)}")
+                    logger.error(f"Lat/lon change rejected: {repr(e)}")
                     response = ERR(ERR_CODE_ILLEGAL_ARG)
 
             elif command == CMD_REMOVE_CONTACT:
@@ -1033,7 +1036,7 @@ class CompanionRadio(BasicMesh):
                 #    flags (1 byte) - currently all zeroes
                 #    path (remaining bytes)
                 if len(frame) < 10:
-                    logger.warnimg("Data frame too short")
+                    logger.warning("Data frame too short")
                     return ERR(ERR_CODE_UNSUPPORTED_CMD)
 
                 tag = frame[1:5]

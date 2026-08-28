@@ -258,3 +258,24 @@ class NewPayloadTypeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AuditRegressionTests(unittest.TestCase):
+    """Findings from the P0-P2 self-audit of this change set."""
+
+    def test_an_advert_claiming_a_position_it_does_not_carry_is_rejected(self):
+        """P0: the flags byte can claim LATLON while the sentence carries none. The short
+        slice then made `struct.unpack` raise `struct.error` — not an InvalidPacket — which
+        escaped the RX loop and terminated the process. Any transmitter on the frequency
+        could do it, unauthenticated, before the advert's signature was ever checked."""
+        raw = bytes([hdr(FLOOD, MC_Packet.TYPE_ADVERT)]) + bytes([0]) \
+            + b'\x00' * 32 + b'\x00' * 4 + b'\x00' * 64 + bytes([0x10])
+        with self.assertRaises(InvalidMeshcorePacket):
+            MC_Incoming.convert_packet(raw, None, None, None)
+
+    def test_str_prints_whole_multi_byte_hops(self):
+        """The path is count*size bytes; slicing by count truncated it."""
+        p = MC_Incoming(wire(FLOOD, path=b'\xaa\xbb\xcc\xdd', payload=b'\x01', hash_size=2))
+        out = str(p)
+        self.assertIn("aabb", out)
+        self.assertIn("ccdd", out)
