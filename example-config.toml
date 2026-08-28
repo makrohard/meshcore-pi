@@ -140,6 +140,12 @@ interface = "wifi"
 # wifi.allow = "192.168.0.0/24"
 # wifi.listen overrides the address derived from wifi.allow (advanced).
 # wifi.listen = '0.0.0.0'
+# Optional idle disconnect, in seconds. Unset or 0 (the default) means a connected client
+# is NEVER dropped for being quiet — a client waiting for adverts or messages sends
+# nothing, and disconnecting it is wrong. Set a positive value only if you specifically
+# want idle sessions reaped. (Incomplete frames are always bounded by short framing
+# timeouts; this is a different concern.)
+# wifi.idle_timeout = 0
 
 # Serial port
 # serial.port = "/dev/ttyS0"

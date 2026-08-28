@@ -11,6 +11,19 @@ logger = logging.getLogger(__name__)
 _LOOPBACK_NET = ipaddress.ip_network('127.0.0.0/8')
 _DEFAULT_ALLOW = ipaddress.ip_network('127.0.0.1/32')
 
+# Upper bound on the resynchronisation buffer. A peer that never sends a start-of-frame
+# byte must not be able to grow this without limit: the junk is only ever logged as a
+# length plus a hex dump, so an unbounded peer could exhaust memory (and then the log).
+# One MTU is far more than any real desynchronisation needs.
+MAX_JUNK_BYTES = 256
+
+# Short timeouts that protect an INCOMPLETE frame — a peer that sent a start-of-frame byte
+# and then stalled must not pin the reader forever. These are framing-progress guards and
+# are unrelated to idle disconnection.
+_RESYNC_BYTE_TIMEOUT = 1.0
+_FRAME_HEADER_TIMEOUT = 1.0
+_FRAME_BODY_TIMEOUT = 5.0
+
 
 def parse_allow_network(value):
     """
@@ -103,10 +116,40 @@ class CompanionInterface(BaseCompanionInterface):
         listen = config.get('listen', None)
         self.listen = listen if listen is not None else derive_listen_host(self._allow_net)
 
+        # OPTIONAL idle disconnect, OFF by default.
+        #
+        # This used to be a hard-coded ~90 s read timeout on the assumption that a companion
+        # app polls battery status every minute. A client that legitimately sits waiting for
+        # adverts or messages sends nothing, so a healthy connection was dropped roughly every
+        # 90 seconds — observed as a long-running CLI session dying while idle. A node must not
+        # disconnect an otherwise healthy peer just because the peer has nothing to say.
+        #
+        # Unset or 0 (the default) => never disconnect on idle. A positive value re-enables a
+        # disconnect after that many seconds without a complete frame.
+        self.idle_timeout = self._parse_idle_timeout(config.get('idle_timeout', 0))
+
         self._reader = None
         self._writer = None
 
         self._connected = asyncio.Event()
+
+    @staticmethod
+    def _parse_idle_timeout(value):
+        """Seconds of inactivity before disconnecting, or None for never.
+
+        Fails SAFE: an unparseable or negative value disables the timeout rather than
+        inventing one, because a spurious disconnect is the failure this option exists to
+        avoid.
+        """
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            logger.error(f"Invalid companion 'idle_timeout' value {value!r} — "
+                         f"disabling the idle disconnect")
+            return None
+        if seconds <= 0:
+            return None
+        return seconds
 
     # Inbound queue
     async def rx(self):
@@ -119,40 +162,32 @@ class CompanionInterface(BaseCompanionInterface):
             try:
                 while True:
                     logger.debug("Waiting for frame")
-                    # Fetch one byte. Hopefully it's a '<'
-
-                    if True:    # config.timeout
-                        # The companion app requests battery status every minute, so we should
-                        # not go for much longer than that without seeing something
-                        r = await asyncio.wait_for(self._reader.readexactly(1), 90)
-                    else:
+                    # Fetch one byte. Hopefully it's a '<'.
+                    #
+                    # NO timeout by default: an idle client is a healthy client. Only an
+                    # explicitly configured `idle_timeout` re-arms a disconnect here.
+                    if self.idle_timeout is None:
                         r = await self._reader.readexactly(1)
+                    else:
+                        r = await asyncio.wait_for(self._reader.readexactly(1),
+                                                   self.idle_timeout)
 
                     if r != b'<':
-                        # Not a start of frame
-                        junkdata = r
-                        while True:
-                            try:
-                                # Keep reading until we hit a < or data stops arriving (1 second pause)
-                                r = await asyncio.wait_for(self._reader.readexactly(1), 1)
-                                if r == b'<':
-                                    if len(junkdata):
-                                        logger.warning(f"Junk data before frame in companion serial data, {len(junkdata)} bytes: {hexlify(junkdata).decode()}")
-                                    break
-                                junkdata += r
-                            except TimeoutError:
-                                if len(junkdata):
-                                    logger.warning(f"Junk data in companion serial data, {len(junkdata)} bytes: {hexlify(junkdata).decode()}")
-                                    # FIXME this needs improving
-                                break
-                        
+                        # Not a start of frame — resynchronise. BOUNDED: a peer that never
+                        # sends '<' must not grow this buffer without limit.
+                        if not await self._resync(r):
+                            continue        # never found a frame start; do not parse junk
+                                            # as a length header (that misframed the stream)
 
-                    # Next two bytes are the frame size
+                    # Next two bytes are the frame size. These timeouts protect an
+                    # INCOMPLETE frame and are deliberately kept.
                     try:
-                        r = await asyncio.wait_for(self._reader.readexactly(2), 1)
+                        r = await asyncio.wait_for(self._reader.readexactly(2),
+                                                   _FRAME_HEADER_TIMEOUT)
                         size = struct.unpack("<H", r)[0]
-                            
-                        r = await asyncio.wait_for(self._reader.readexactly(size), 5)
+
+                        r = await asyncio.wait_for(self._reader.readexactly(size),
+                                                   _FRAME_BODY_TIMEOUT)
 
                         logger.debug(f"Received frame, {len(r)} bytes")
 
@@ -163,18 +198,54 @@ class CompanionInterface(BaseCompanionInterface):
             except asyncio.exceptions.IncompleteReadError:
                 # The connection was lost
                 logger.info("Connection to Meshcore app lost")
-                self._writer = None
-                self._connected.clear()
+                self._reset_connection()
             except TimeoutError:
-                # Connection time out
+                # Idle timeout (only reachable when one is configured)
                 logger.info("Connection to Meshcore app timed out")
-                self._writer.close()
-                self._writer = None
-                self._connected.clear()
+                self._reset_connection(close=True)
             except Exception as e:
                 logger.error(f"Connection lost due to: {repr(e)}")
-                self._writer = None
-                self._connected.clear()
+                self._reset_connection()
+
+    async def _resync(self, first):
+        """Consume bytes until a start-of-frame '<'. True when one was found.
+
+        Returns False when the peer stops sending or floods more than MAX_JUNK_BYTES of
+        non-frame data — the caller must then NOT read a length header, or it would
+        interpret junk as a frame and stay misframed.
+        """
+        junkdata = bytearray(first)
+        while True:
+            if len(junkdata) >= MAX_JUNK_BYTES:
+                logger.warning(f"Discarding {len(junkdata)} bytes of junk from companion "
+                               f"data without finding a frame start")
+                return False
+            try:
+                r = await asyncio.wait_for(self._reader.readexactly(1),
+                                           _RESYNC_BYTE_TIMEOUT)
+            except TimeoutError:
+                logger.warning(f"Junk data in companion data, {len(junkdata)} bytes: "
+                               f"{hexlify(bytes(junkdata)).decode()}")
+                return False
+            if r == b'<':
+                if junkdata:
+                    logger.warning(f"Junk data before frame in companion data, "
+                                   f"{len(junkdata)} bytes: "
+                                   f"{hexlify(bytes(junkdata)).decode()}")
+                return True
+            junkdata += r
+
+    def _reset_connection(self, close=False):
+        """Drop reader AND writer together, so a stale reader can never be used against a
+        connection we have already given up on."""
+        if close and self._writer is not None:
+            try:
+                self._writer.close()
+            except Exception:
+                pass
+        self._reader = None
+        self._writer = None
+        self._connected.clear()
     
 
     async def tx(self, frame):
@@ -192,12 +263,7 @@ class CompanionInterface(BaseCompanionInterface):
             await self._writer.drain()
         except Exception as e:
             logger.debug(f"Exception sending data: {repr(e)}")
-            try:
-                self._writer.close()
-            except Exception:
-                pass
-            self._writer = None
-            self._connected.clear()
+            self._reset_connection(close=True)
             return
 
         logger.debug("Data sent to app device.")
