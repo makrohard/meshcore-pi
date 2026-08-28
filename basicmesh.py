@@ -338,31 +338,49 @@ class BasicMesh:
                     continue
 
                 # Repeat this packet
-                if receivedpacket.is_flood():
-                    # Add our id to this packet and send it onwards
-                    if receivedpacket.pathlen < 63:
-                        receivedpacket.path.append(self.me.hash)
-                        self.stats[f"repeat.Flood.{receivedpacket.pathlen}"] += 1
-                    else:
-                        # Hop limit reached
-                        logger.warning("Flood repeat: path length exceeded")
-                        self.stats["repeat.Flood.too_long"] += 1
-                        continue
-                else:
-                    # Only forward this packet if the first hop matches our id
-                    if receivedpacket.pathlen == 0:
-                        self.stats["repeat.Direct.zerohop"] += 1
-                        continue
-                    elif receivedpacket.path[0] != self.me.hash:
-                        self.stats["repeat.Direct.notme"] += 1
-                        continue
-                    else:
-                        receivedpacket.path.pop()
-                        self.stats[f"repeat.Direct.{receivedpacket.pathlen}"] += 1
+                if not self.prepare_forward(receivedpacket):
+                    continue
 
                 # Reached this point - we have a packet to forward
 
                 current_taskgroup.get().create_task(self.transmit_packet(receivedpacket), name="TX repeater")
+
+    def prepare_forward(self, receivedpacket):
+        """Rewrite a received packet's path for retransmission. True if it should be sent.
+
+        Path entries are `path_hash_size` bytes each (1 for all legacy traffic), so both
+        branches work in ENTRIES, never in bare bytes — appending or removing a single byte
+        would misalign a 2- or 3-byte-hash path and corrupt every hop after it.
+        """
+        size = receivedpacket.path_hash_size
+        if receivedpacket.is_flood():
+            # Add our id to this packet and send it onwards. TWO limits, and both bind:
+            # the path must fit MAX_PATH_SIZE bytes, and the hash COUNT field is 6 bits, so
+            # a 64th entry is unrepresentable however small the hashes are.
+            if (receivedpacket.pathlen + 1) <= 63 and \
+                    (receivedpacket.pathlen + 1) * size <= packet.MC_Packet.MAX_PATH_SIZE:
+                receivedpacket.path += self.me.path_hash(size)
+                self.stats[f"repeat.Flood.{receivedpacket.pathlen}"] += 1
+                return True
+            # Hop limit reached
+            logger.warning("Flood repeat: path length exceeded")
+            self.stats["repeat.Flood.too_long"] += 1
+            return False
+
+        # Only forward this packet if the first hop matches our id
+        if receivedpacket.pathlen == 0:
+            self.stats["repeat.Direct.zerohop"] += 1
+            return False
+        if bytes(receivedpacket.path[:size]) != self.me.path_hash(size):
+            self.stats["repeat.Direct.notme"] += 1
+            return False
+        # Consume OUR hop: drop the FIRST entry and shift the rest down, so the next hop
+        # leads. (`mesh::Mesh` decrements the hash count and shuffles the path by one
+        # entry.) Removing the LAST entry instead — as this did — sent a multi-hop packet
+        # back the way it came instead of onwards.
+        del receivedpacket.path[:size]
+        self.stats[f"repeat.Direct.{receivedpacket.pathlen}"] += 1
+        return True
 
     async def transmit_packet(self, tx_packet:packet.MC_Packet, callback=None, priority=None):
         # Fix the packet's payload

@@ -16,7 +16,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 types = ['REQ', 'RESPONSE', 'TXT_MSG', 'ACK', 'ADVERT', 'GRP_TXT', 'GRP_DATA', 'ANON_REQ',
-         'PATH', 'TRACE', 'RESERVED1', 'RESERVED2', 'RESERVED3', 'RESERVED4', 'RESERVED5', 'RAW_CUSTOM']
+         'PATH', 'TRACE', 'MULTIPART', 'CONTROL', 'RESERVED3', 'RESERVED4', 'RESERVED5', 'RAW_CUSTOM']
 
 def typename(t):
     try:
@@ -99,8 +99,13 @@ class MC_Packet:
     # Room server messages are 4 bytes shorter to account for the pubkey of the sender
     MAX_TEXT_MESSAGE = 171
 
+    # Route types (header bits 0-1). All four are defined by current MeshCore; the two
+    # TRANSPORT variants additionally carry two 16-bit transport codes between the header
+    # and the path-length byte.
+    ROUTE_TRANSPORT_FLOOD = 0x00   # flood mode + transport codes
     ROUTE_FLOOD = 0x01      # flood mode, needs path to be built up (max 64 bytes)
     ROUTE_DIRECT = 0x02     # direct route, path is supplied
+    ROUTE_TRANSPORT_DIRECT = 0x03  # direct route + transport codes
 
     TYPE_REQ = 0x00          # request (prefixed with dest/src hashes, MAC) (enc data: timestamp, blob)
     TYPE_RESPONSE = 0x01     # response to REQ or ANON_REQ (prefixed with dest/src hashes, MAC) (enc data: timestamp, blob)
@@ -112,8 +117,8 @@ class MC_Packet:
     TYPE_ANON_REQ = 0x07     # generic request (prefixed with dest_hash, ephemeral pub_key, MAC) (enc data: ...)
     TYPE_PATH = 0x08         # returned path (prefixed with dest/src hashes, MAC) (enc data: path, extra)
     TYPE_TRACE = 0x09        # trace a path, collecting SNI for each hop
-    TYPE_RESERVED1 = 0x0A    # FUTURE
-    TYPE_RESERVED2 = 0x0B    # FUTURE
+    TYPE_MULTIPART = 0x0A    # packet is one of a set of packets
+    TYPE_CONTROL = 0x0B      # a control/discovery packet
     TYPE_RESERVED3 = 0x0C    # FUTURE
     TYPE_RESERVED4 = 0x0D    # FUTURE
     TYPE_RESERVED5 = 0x0E    # FUTURE
@@ -145,6 +150,14 @@ class MC_Packet:
     def __init__(self):
         self.header = 0
         self.path = bytearray()
+        # Bytes per path hash (1..3). The wire path-length byte encodes size and COUNT
+        # separately, so `len(self.path)` alone no longer describes the path. Legacy
+        # traffic is all size 1, where count == byte length and everything below behaves
+        # exactly as it did before.
+        self.path_hash_size = self.PATH_HASH_SIZE
+        # Two 16-bit transport codes, present on the wire only for the TRANSPORT routes.
+        # Carried losslessly so a repeated packet keeps them.
+        self.transport_codes = (0, 0)
         self._payload = b''
         self._computed_payload = b''
 
@@ -163,21 +176,64 @@ class MC_Packet:
     def __len__(self):
         return len(self.packet)
 
-    # The whole packet, including header, path and payload
+    # The whole packet, including header, transport codes, path and payload.
+    #
+    # Wire order (mesh::Packet::writeTo):
+    #   header | [transport_codes[0], transport_codes[1] as LE uint16] | path_len | path | payload
     @property
     def packet(self):
-        if self.route == self.ROUTE_DIRECT or self.route == self.ROUTE_FLOOD:
-            packet = bytearray([self.header, self.pathlen]) + self.path + self.payload
-            if len(packet) > self.MAX_PACKET_PAYLOAD:
-                raise InvalidMeshcorePacket("Packet exceeds maximum payload size.")
-            return packet
-        else:
-            raise InvalidMeshcorePacket("Invalid route type for packet construction.")
+        payload = self.payload
+        if len(payload) > self.MAX_PACKET_PAYLOAD:
+            # The PAYLOAD is what is capped at 184; the whole frame may be longer because
+            # of the path (up to 64 bytes) and transport codes. Checking the total against
+            # 184 refused legitimate long-path packets.
+            raise InvalidMeshcorePacket("Packet exceeds maximum payload size.")
+        packet = bytearray([self.header])
+        if self.has_transport_codes():
+            packet += struct.pack("<HH", self.transport_codes[0] & 0xffff,
+                                  self.transport_codes[1] & 0xffff)
+        packet += bytearray([self.encoded_pathlen]) + self.path + payload
+        if len(packet) > self.MAX_TRANS_UNIT:
+            raise InvalidMeshcorePacket("Packet exceeds maximum transmission unit.")
+        return packet
 
-    # The path length, either of the received path (for flood packets), or the remaining path (for direct packets)
+    # The number of path HASHES, either of the received path (flood) or the remaining path
+    # (direct). Unchanged meaning for 1-byte hashes, which is all legacy traffic uses.
     @property
     def pathlen(self):
-        return len(self.path)
+        return len(self.path) // self.path_hash_size
+
+    @property
+    def encoded_pathlen(self):
+        """The wire path-length byte: hash size in the top 2 bits, hash count in the low 6.
+
+        (`mesh::Packet::setPathHashSizeAndCount`.) A 1-byte hash encodes as the bare count,
+        which is why legacy packets are byte-identical to what this produced before.
+        """
+        count = self.pathlen
+        if count > 63:
+            raise InvalidMeshcorePacket("Path has too many hashes")
+        return ((self.path_hash_size - 1) << 6) | count
+
+    @classmethod
+    def decode_pathlen(cls, encoded):
+        """(hash_size, hash_count, byte_length) from a wire path-length byte.
+
+        Raises for an encoding current MeshCore rejects (`mesh::Packet::isValidPathLen`):
+        hash size 4 is reserved, and the path must fit MAX_PATH_SIZE.
+        """
+        count = encoded & 0x3f
+        size = (encoded >> 6) + 1
+        if size == 4:
+            raise InvalidMeshcorePacket("Reserved path hash size")
+        length = count * size
+        if length > cls.MAX_PATH_SIZE:
+            raise InvalidMeshcorePacket("Path length too long")
+        return size, count, length
+
+    def has_transport_codes(self):
+        """Do this packet's route bits put transport codes on the wire?"""
+        return self.route in (self.ROUTE_TRANSPORT_FLOOD, self.ROUTE_TRANSPORT_DIRECT)
 
     # The payload of the packet
     # Derived classes should set the computed payload
@@ -230,24 +286,24 @@ class MC_Packet:
 
     @property
     def routename(self):
-        if self.route == self.ROUTE_DIRECT:
-            return "Direct"
-        if self.route == self.ROUTE_FLOOD:
-            return "Flood"
-        return "Unknown"
+        return {
+            self.ROUTE_TRANSPORT_FLOOD: "TransportFlood",
+            self.ROUTE_FLOOD: "Flood",
+            self.ROUTE_DIRECT: "Direct",
+            self.ROUTE_TRANSPORT_DIRECT: "TransportDirect",
+        }.get(self.route, "Unknown")
 
-    # FIXME - these don't account for packets with transport codes
     def is_flood(self):
         """
-        Is this a flooded packet?
+        Is this a flooded packet? (`mesh::Packet::isRouteFlood`)
         """
-        return self.route == self.ROUTE_FLOOD
+        return self.route in (self.ROUTE_FLOOD, self.ROUTE_TRANSPORT_FLOOD)
 
     def is_direct(self):
         """
-        Is this a direct packet?
+        Is this a direct packet? (`mesh::Packet::isRouteDirect`)
         """
-        return self.route == self.ROUTE_DIRECT
+        return self.route in (self.ROUTE_DIRECT, self.ROUTE_TRANSPORT_DIRECT)
 
     # Check the payload length is at least the value supplied
     # Raise an exception if not
@@ -281,14 +337,36 @@ class MC_Incoming(MC_Packet):
         super().__init__()
 
         if isinstance(packet, (bytes, bytearray)):
-            # Split the packet into header, path, and payload
+            # Split the packet into header, transport codes, path and payload, in the
+            # order current MeshCore writes them (`mesh::Packet::readFrom`).
+            if len(packet) < 2:
+                raise InvalidMeshcorePacket("Packet length too short")
             self.header = packet[0]
-            pathlen = packet[1]
-            if pathlen > 63 or pathlen > (len(packet)-2):
+            i = 1
+            if self.has_transport_codes():
+                # Transport codes sit BEFORE the path-length byte. Reading path_len from
+                # offset 1 regardless — as this used to — consumed the first transport
+                # code byte as a length and corrupted every transport packet.
+                if len(packet) < 6:
+                    raise InvalidMeshcorePacket("Truncated transport codes")
+                self.transport_codes = struct.unpack("<HH", bytes(packet[1:5]))
+                i = 5
+            if len(packet) <= i:
+                raise InvalidMeshcorePacket("Packet length too short")
+
+            self.path_hash_size, _count, pathbytes = self.decode_pathlen(packet[i])
+            i += 1
+            if pathbytes > (len(packet) - i):
                 raise InvalidMeshcorePacket("Path length too long")
-            
-            self.path = bytearray(packet[2:2 + pathlen])
-            self._payload = packet[2 + pathlen:]
+
+            self.path = bytearray(packet[i:i + pathbytes])
+            i += pathbytes
+            if i >= len(packet):
+                # Upstream `readFrom` rejects a packet with no payload bytes left.
+                raise InvalidMeshcorePacket("Packet has no payload")
+            self._payload = packet[i:]
+            if len(self._payload) > self.MAX_PACKET_PAYLOAD:
+                raise InvalidMeshcorePacket("Payload exceeds maximum size")
             self.externalpayload = True
             
             # If we're a repeater, should we repeat this packet?
@@ -400,7 +478,10 @@ class MC_Outgoing(MC_Packet):
                 self.path = path
             else:
                 raise ValueError("Path must be bytes or bytearray")
-            if len(path) > 63:
+            # Two independent limits: at most 63 path ENTRIES (the count field is 6 bits)
+            # and at most MAX_PATH_SIZE bytes. Outgoing paths come from stored contacts and
+            # are 1-byte hashes, where these coincide.
+            if self.pathlen > 63 or len(self.path) > self.MAX_PATH_SIZE:
                 raise ValueError("Path is too long")
 
         self.header |= (type << 2) | (self.VER_1 << 6)
@@ -425,10 +506,13 @@ class MC_Outgoing(MC_Packet):
         return len(self.packet)
 
 
-    # Get the next hop from the path
+    # Get the next hop from the path (the first ENTRY, which is one byte for the 1-byte
+    # hashes every outgoing path uses)
     def nexthop(self):
-        if self.route == self.ROUTE_DIRECT and len(self.path):
-            return self.path[0]
+        if self.is_direct() and len(self.path):
+            if self.path_hash_size == 1:
+                return self.path[0]
+            return bytes(self.path[:self.path_hash_size])
         else:
             return None
 

@@ -127,8 +127,11 @@ class Dispatch:
         if type == p.TYPE_TRACE:
             # Trace packets can legitimately be seen more than once (eg, on the way back)
             # The packet payload will be the same, but the path will be different as that's
-            # where the trace SNR values get stored, so include the path length in the hash
-            hash.update(bytes([p.pathlen]))
+            # where the trace SNR values get stored, so include the path length in the hash.
+            # The ENCODED byte (`mesh::Packet::calculatePacketHash` hashes the wire field),
+            # so two paths with the same hop count but different hash sizes stay distinct.
+            # Identical to the old value for 1-byte hashes.
+            hash.update(bytes([p.encoded_pathlen]))
 
         hash.update(bytes(p.payload))
         hash.update(extra)

@@ -232,6 +232,12 @@ class Destination:
     def hash(self):
         return self.pubkey[0]
 
+    def path_hash(self, size=1):
+        """The node's path hash at `size` bytes — simply the public-key prefix, as in
+        `mesh::Identity::copyHashTo`. Current MeshCore paths may use 1-, 2- or 3-byte
+        hashes, and a packet's own size must be honoured when forwarding it."""
+        return bytes(self.pubkey[:size])
+
     # Set the shared secret
     def create_shared_secret(self, private_key:ED25519_Wrapper):
         self._sharedsecret = private_key.shared_secret(self.pubkey)
@@ -398,6 +404,10 @@ class SelfIdentity(AdvertBase):
     @property
     def hash(self):
         return self.private_key.public_key[0]
+
+    def path_hash(self, size=1):
+        """The node's path hash at `size` bytes (see `Identity.path_hash`)."""
+        return bytes(self.private_key.public_key[:size])
 
 
 class IdentityStore:
