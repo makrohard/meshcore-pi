@@ -223,3 +223,44 @@ class PushFrameTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DispatchNeverKillsTheNodeTests(unittest.IsolatedAsyncioTestCase):
+    """AUDIT-FOUND: the parse guard in mesh_task covered DECODING only.
+
+    `Repeater.rx_trace` raises InvalidMeshcorePacket outright when a trace carries more SNR
+    bytes than its route has hops. That raise is in the DISPATCH half of the loop, outside
+    the guard, so it escaped mesh_task, failed the aiotools TaskGroup and terminated the
+    process — a remote, unauthenticated kill from anyone transmitting on the frequency.
+    """
+
+    async def test_a_trace_with_more_snrs_than_hops_does_not_escape(self):
+        r = self._repeater()
+        # 1 hop of route, but 10 SNR bytes in the packet's own path => done > hops.
+        p = packet.MC_Trace(trace_packet(b'\x11', 0, b'\x01' * 10))
+        with self.assertRaises(InvalidMeshcorePacket):
+            await r.rx_trace(p)          # the handler still reports the bad packet...
+
+    async def test_a_full_trace_path_is_dropped_instead_of_failing_to_encode(self):
+        """A 64th path entry is unrepresentable in the 6-bit count field, so appending our
+        SNR would raise while ENCODING the reply — inside the transmit task, uncaught."""
+        import aiotools
+        r = self._repeater()
+        route = b'\x99' * 63 + b'\xa1'      # 64 hops; the one we are at (index 63) is US
+        p = packet.MC_Trace(trace_packet(route, 0, b'\x02' * 63))
+        async with aiotools.TaskGroup():
+            await r.rx_trace(p)
+        self.assertEqual(len(p.path), 63, "must not grow past the representable maximum")
+        self.assertEqual(r.transmitted, [], "nothing unserialisable may be queued")
+
+    def _repeater(self):
+        from repeater import Repeater
+        r = Repeater.__new__(Repeater)
+        r.me = _Me()
+        r.stats = defaultdict(int)
+        r.transmitted = []
+
+        async def fake_tx(p, **kw):
+            r.transmitted.append(p)
+        r.transmit_packet = fake_tx
+        return r

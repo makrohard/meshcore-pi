@@ -3,6 +3,7 @@ import asyncio
 from binascii import hexlify
 import ipaddress
 import struct
+import socket
 
 import logging
 logger = logging.getLogger(__name__)
@@ -297,9 +298,30 @@ class CompanionInterface(BaseCompanionInterface):
         logger.debug(f"Connection callback - client has connected from {addr}")
 
         if self._writer is not None:
-            logger.info("Client already connected, disconnecting")
-            writer.close()
-            return
+            # The previous peer may be GONE without the socket ever telling us: a half-open
+            # drop (Wi-Fi -> cellular handover, AP loss, NAT rebind) delivers no FIN and no
+            # RST, and with no read timeout `rx()` waits on that dead reader forever. If we
+            # refused the newcomer here, `_writer` would stay set and EVERY reconnect from
+            # the rightful client would be turned away — the port wedged until the process
+            # restarts. The old hard-coded 90 s read timeout used to paper over this.
+            #
+            # The newcomer has already passed the `allow` check above, so hand the session
+            # over rather than refusing it. Companion is single-client by design; the most
+            # recent allowed peer is the one that wants to talk.
+            logger.info("Client already connected — taking over for the new peer")
+            self._reset_connection(close=True)
+
+        # Detect a peer that disappears without closing, so a session that is never taken
+        # over still cannot pin the port open indefinitely.
+        sock = writer.get_extra_info('socket')
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                for opt, val in (('TCP_KEEPIDLE', 60), ('TCP_KEEPINTVL', 15), ('TCP_KEEPCNT', 4)):
+                    if hasattr(socket, opt):
+                        sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+            except OSError:
+                pass                      # keepalive is a bonus, never a reason to refuse
 
         self._reader = reader
         self._writer = writer

@@ -63,6 +63,11 @@ class _FakeWriter:
     def close(self):
         self.closed = True
 
+    def get_extra_info(self, name):
+        # A real StreamWriter answers 'peername' and 'socket'; the fake has no socket, which
+        # is exactly the case the keepalive setup must tolerate.
+        return ('127.0.0.1', 5000) if name == 'peername' else None
+
 
 def _iface(**cfg):
     iface = CompanionInterface(cfg)
@@ -262,3 +267,39 @@ class MidFrameTimeoutTests(unittest.TestCase):
 
         self.assertTrue(_run(go(), timeout=9.0))
         self.assertIsNone(iface._writer)
+
+
+class HalfOpenTakeoverTests(unittest.TestCase):
+    """AUDIT-FOUND: with no read timeout, a half-open drop wedged the port permanently.
+
+    A peer that vanishes without FIN/RST (Wi-Fi -> cellular handover, AP loss, NAT rebind)
+    leaves `rx()` blocked on a dead reader forever, so `_writer` stays set. The old code
+    refused every reconnect with "Client already connected", so the rightful client could
+    never get back in — the 90 s read timeout used to hide this. An allowed newcomer must
+    take the session over instead.
+    """
+
+    def test_an_allowed_newcomer_takes_over_a_stale_session(self):
+        iface = _iface()                             # already "connected" to a dead peer
+        stale_writer = iface._writer
+        new_reader, new_writer = _FakeReader(), _FakeWriter()
+
+        _run(iface.connected(new_reader, new_writer))
+
+        self.assertTrue(stale_writer.closed, "the stale transport must be closed, not leaked")
+        self.assertIs(iface._writer, new_writer, "the newcomer must own the session")
+        self.assertIs(iface._reader, new_reader)
+        self.assertTrue(iface._connected.is_set())
+        self.assertFalse(new_writer.closed, "the newcomer must NOT be turned away")
+
+    def test_a_disallowed_newcomer_never_takes_over(self):
+        """Takeover happens AFTER the allow-list gate, so it is not a way in."""
+        iface = _iface(allow='10.0.0.0/8')           # 127.0.0.1 is not allowed
+        held_writer = iface._writer
+        new_writer = _FakeWriter()
+
+        _run(iface.connected(_FakeReader(), new_writer))
+
+        self.assertTrue(new_writer.closed, "rejected peer must be closed")
+        self.assertIs(iface._writer, held_writer, "existing session must be untouched")
+        self.assertFalse(held_writer.closed)

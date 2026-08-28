@@ -49,7 +49,15 @@ class Repeater(CLIDevice):
 
             if currenthop == self.me.path_hash(rx_packet.trace_hash_size):
                 # Current hop matches my pubkey hash, so this is (probably) for me
-                # Add the current packet SNR to the path
+                # Add the current packet SNR to the path.
+                #
+                # BOUNDED: the path length field carries a 6-bit COUNT, so a 64th entry is
+                # unrepresentable and encoded_pathlen would raise while ENCODING the reply —
+                # inside the transmit task, where nothing catches it. Drop the trace instead
+                # of building a packet that cannot be serialised.
+                if len(rx_packet.path) >= 63:
+                    logger.warning("Trace path is full; not appending our SNR")
+                    return
                 rx_packet.path += bytes([int(rx_packet.snr * 4) & 0xff])
                 # And resend the packet
                 current_taskgroup.get().create_task(self.transmit_packet(rx_packet))

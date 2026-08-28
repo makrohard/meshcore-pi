@@ -278,89 +278,105 @@ class BasicMesh:
                 continue
 
 
-            # Do something with the raw packet, if needed
-            # Companion apps use it to see if a message has been repeated
-            await self.rx_raw(receivedpacket)
+            # DEFENCE IN DEPTH, second half. The parse guard above only covers DECODING.
+            # Dispatch runs handlers that also raise on hostile input — Repeater.rx_trace
+            # raises InvalidMeshcorePacket outright for a trace whose SNR data is longer
+            # than its route, and a forwarded packet can overflow the path encoder — and an
+            # escape here fails the mesh task and terminates the process, i.e. a remote,
+            # unauthenticated kill from anyone on the frequency.
+            try:
+                # Do something with the raw packet, if needed
+                # Companion apps use it to see if a message has been repeated
+                await self.rx_raw(receivedpacket)
 
-            self.stats["received"] += 1
+                self.stats["received"] += 1
 
-            if self.dispatch.hasSeen(receivedpacket, extra=self.me.private_key.public_key):
-                # Duplicate packet
-                logger.debug("Duplicate packet, already seen; discarding")
+                if self.dispatch.hasSeen(receivedpacket, extra=self.me.private_key.public_key):
+                    # Duplicate packet
+                    logger.debug("Duplicate packet, already seen; discarding")
 
-                # Record it as a statistic and throw it away
-                self.stats["duplicate"] += 1
-                # DIRECT or FLOOD
-                self.stats[f"duplicate.{receivedpacket.routename}"] += 1
+                    # Record it as a statistic and throw it away
+                    self.stats["duplicate"] += 1
+                    # DIRECT or FLOOD
+                    self.stats[f"duplicate.{receivedpacket.routename}"] += 1
+                    continue
+
+                # More stats
+                # DIRECT or FLOOD, plus hop count
+                self.stats[f"received.{receivedpacket.routename}"] += 1
+                self.stats[f"received.{receivedpacket.routename}.{receivedpacket.pathlen}"] += 1
+                # ADVERT, PATH, etc
+                self.stats[f"type.{receivedpacket.typename}"] += 1
+
+                logger.debug("Class: %s", receivedpacket.__class__.__name__)
+
+                if isinstance(receivedpacket, packet.MC_Path) and receivedpacket.decrypted:
+                    logger.debug(f"Received path from {receivedpacket.source.name}: {pathstr(receivedpacket.pathdata)}")
+                    id = receivedpacket.source
+                    id.path = receivedpacket.pathdata
+                    # Keep the hash size the path was encoded with; without it the next direct
+                    # send re-encodes these bytes as 1-byte hops and routes nowhere.
+                    id.path_hash_size = receivedpacket.path_hash_size
+                    self.ids.add_identity(id)
+                    # Callback to UI update path?
+
+                if isinstance(receivedpacket, packet.MC_Advert):
+                    if receivedpacket.advert.validate():
+                        await self.rx_advert(receivedpacket)
+
+                elif isinstance(receivedpacket, packet.MC_GroupText) and receivedpacket.decrypted:
+                    await self.rx_grouptext(receivedpacket)
+
+                elif isinstance(receivedpacket, packet.MC_Ack) or (
+                        isinstance(receivedpacket, packet.MC_Path) and receivedpacket.decrypted and
+                        receivedpacket.ackhash is not None):
+                    # Packet contains an acknowledgement of a previously-sent message
+                    await self.rx_ack(receivedpacket)
+
+                elif ((isinstance(receivedpacket, packet.MC_Response) or isinstance(receivedpacket, packet.MC_Path)) and
+                        receivedpacket.decrypted and receivedpacket.response is not None):
+                    # Packet contains a response
+                    await self.rx_response(receivedpacket)
+
+                elif isinstance(receivedpacket, packet.MC_Text) and receivedpacket.decrypted:
+                    await self.received_text(receivedpacket)
+
+                elif isinstance(receivedpacket, packet.MC_AnonReq) and receivedpacket.decrypted:
+                    await self.rx_anonreq(receivedpacket)
+
+                elif isinstance(receivedpacket, packet.MC_Req) and receivedpacket.decrypted:
+                    await self.rx_req(receivedpacket)
+
+                elif isinstance(receivedpacket, packet.MC_Trace):
+                    await self.rx_trace(receivedpacket)
+
+                # Any general-purpose activity can go here (eg, printing the packet out)
+                await self.rx(receivedpacket)
+
+                # Repeater actions
+                # Only repeat the packet if we're a repeater, and this packet is repeatable
+                if self.repeater and receivedpacket.repeat:
+                    # Don't repeat TRACE packets
+                    # They're handled (and forwarded) in rx_trace()
+                    if isinstance(receivedpacket, packet.MC_Trace):
+                        continue
+
+                    # Repeat this packet
+                    if not self.prepare_forward(receivedpacket):
+                        continue
+
+                    # Reached this point - we have a packet to forward
+
+                    current_taskgroup.get().create_task(self.transmit_packet(receivedpacket), name="TX repeater")
+            except InvalidPacket as e:
+                logger.warning(f"Bad packet in dispatch: {e.args}")
+                self.stats["badpacket"] += 1
                 continue
-
-            # More stats
-            # DIRECT or FLOOD, plus hop count
-            self.stats[f"received.{receivedpacket.routename}"] += 1
-            self.stats[f"received.{receivedpacket.routename}.{receivedpacket.pathlen}"] += 1
-            # ADVERT, PATH, etc
-            self.stats[f"type.{receivedpacket.typename}"] += 1
-
-            logger.debug("Class: %s", receivedpacket.__class__.__name__)
-
-            if isinstance(receivedpacket, packet.MC_Path) and receivedpacket.decrypted:
-                logger.debug(f"Received path from {receivedpacket.source.name}: {pathstr(receivedpacket.pathdata)}")
-                id = receivedpacket.source
-                id.path = receivedpacket.pathdata
-                # Keep the hash size the path was encoded with; without it the next direct
-                # send re-encodes these bytes as 1-byte hops and routes nowhere.
-                id.path_hash_size = receivedpacket.path_hash_size
-                self.ids.add_identity(id)
-                # Callback to UI update path?
-
-            if isinstance(receivedpacket, packet.MC_Advert):
-                if receivedpacket.advert.validate():
-                    await self.rx_advert(receivedpacket)
-
-            elif isinstance(receivedpacket, packet.MC_GroupText) and receivedpacket.decrypted:
-                await self.rx_grouptext(receivedpacket)
-
-            elif isinstance(receivedpacket, packet.MC_Ack) or (
-                    isinstance(receivedpacket, packet.MC_Path) and receivedpacket.decrypted and
-                    receivedpacket.ackhash is not None):
-                # Packet contains an acknowledgement of a previously-sent message
-                await self.rx_ack(receivedpacket)
-
-            elif ((isinstance(receivedpacket, packet.MC_Response) or isinstance(receivedpacket, packet.MC_Path)) and
-                    receivedpacket.decrypted and receivedpacket.response is not None):
-                # Packet contains a response
-                await self.rx_response(receivedpacket)
-
-            elif isinstance(receivedpacket, packet.MC_Text) and receivedpacket.decrypted:
-                await self.received_text(receivedpacket)
-
-            elif isinstance(receivedpacket, packet.MC_AnonReq) and receivedpacket.decrypted:
-                await self.rx_anonreq(receivedpacket)
-
-            elif isinstance(receivedpacket, packet.MC_Req) and receivedpacket.decrypted:
-                await self.rx_req(receivedpacket)
-
-            elif isinstance(receivedpacket, packet.MC_Trace):
-                await self.rx_trace(receivedpacket)
-
-            # Any general-purpose activity can go here (eg, printing the packet out)
-            await self.rx(receivedpacket)
-
-            # Repeater actions
-            # Only repeat the packet if we're a repeater, and this packet is repeatable
-            if self.repeater and receivedpacket.repeat:
-                # Don't repeat TRACE packets
-                # They're handled (and forwarded) in rx_trace()
-                if isinstance(receivedpacket, packet.MC_Trace):
-                    continue
-
-                # Repeat this packet
-                if not self.prepare_forward(receivedpacket):
-                    continue
-
-                # Reached this point - we have a packet to forward
-
-                current_taskgroup.get().create_task(self.transmit_packet(receivedpacket), name="TX repeater")
+            except Exception as e:
+                # `asyncio.CancelledError` is a BaseException, so shutdown still works.
+                logger.warning(f"Dispatch failed ({type(e).__name__}): {e.args}")
+                self.stats["badpacket"] += 1
+                continue
 
     def prepare_forward(self, receivedpacket):
         """Rewrite a received packet's path for retransmission. True if it should be sent.
