@@ -151,5 +151,75 @@ class TraceOutTests(unittest.TestCase):
         self.assertEqual(len(p.tracepath), packet.MC_Packet.MAX_PATH_SIZE)
 
 
+
+
+class PushFrameTests(unittest.TestCase):
+    """The TRACE_DATA frame handed to the app, pinned to the upstream layout.
+
+    mesh MyMesh::onTraceRecv writes ONE length byte and the client uses it TWICE:
+
+        out_frame[2] = path_len                      # BYTES of path_hashes
+        memcpy(..., path_hashes, path_len)
+        memcpy(..., path_snrs,   path_len >> path_sz)   # one SNR per HOP
+        out_frame[i++] = final SNR
+
+    So it is a BYTE count, not a hop count. The two coincide only for 1-byte hashes, which
+    is exactly why sending the hop count passed every single-byte test while corrupting
+    every multi-byte one.
+    """
+
+    def _push(self, route, flags, snrs):
+        import asyncio
+        import companionradio as cr
+        radio = cr.CompanionRadio.__new__(cr.CompanionRadio)
+        sent = []
+
+        class _App:
+            async def tx(self, m):
+                sent.append(m)
+        radio.appinterface = _App()
+        p = packet.MC_Trace(trace_packet(route, flags, snrs))
+        p.snr = 0.0
+        asyncio.run(radio.rx_trace(p))
+        return sent[0] if sent else None
+
+    def test_length_byte_is_the_hash_byte_count(self):
+        route = b'\xaa\xbb' b'\xcc\xdd' b'\xee\xff'         # 3 hops, 2-byte hashes
+        frame = self._push(route, 1, b'\x01\x02\x03')
+        self.assertIsNotNone(frame)
+        self.assertEqual(frame[0], 0x89)
+        self.assertEqual(frame[1], 0)
+        self.assertEqual(frame[2], len(route), "must be BYTES (6), not hops (3)")
+        self.assertEqual(frame[3], 1)
+
+    def test_the_client_can_split_the_frame_using_that_one_byte(self):
+        """Reproduce the client's own arithmetic and check every field lands."""
+        route = b'\xaa\xbb' b'\xcc\xdd' b'\xee\xff'
+        snrs = b'\x04\x08\x0c'
+        frame = self._push(route, 1, snrs)
+        path_len = frame[2]
+        path_sz = frame[3] & 0x03
+        i = 4 + 4 + 4                                       # header + tag + auth
+        self.assertEqual(frame[i:i + path_len], route)
+        i += path_len
+        n_snr = path_len >> path_sz
+        self.assertEqual(n_snr, 3)
+        self.assertEqual(frame[i:i + n_snr], snrs)
+        i += n_snr
+        self.assertEqual(len(frame) - i, 1, "exactly one final SNR byte remains")
+
+    def test_one_byte_hashes_are_unchanged(self):
+        route = b'\x11\x22\x33'
+        frame = self._push(route, 0, b'\x01\x02\x03')
+        self.assertEqual(frame[2], 3)                       # bytes == hops here
+        self.assertEqual(len(frame), 4 + 4 + 4 + 3 + 3 + 1)
+
+    def test_four_byte_hashes(self):
+        route = b'\x5a' * 8                                 # 2 hops of 4 bytes
+        frame = self._push(route, 2, b'\x01\x02')
+        self.assertEqual(frame[2], 8)
+        self.assertEqual(frame[2] >> (frame[3] & 3), 2)     # client derives 2 SNRs
+
+
 if __name__ == '__main__':
     unittest.main()

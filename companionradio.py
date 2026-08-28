@@ -658,7 +658,9 @@ class CompanionRadio(BasicMesh):
 
     # Return the results of a trace to the app
     async def rx_trace(self, rx_packet:packet.MC_Trace):
-        logger.debug(f"Received Trace, tag {hexlify(rx_packet.tag).decode()}, {len(rx_packet.tracepath)} hops, {len(rx_packet.path)} results")
+        logger.debug(f"Received Trace, tag {hexlify(rx_packet.tag).decode()}, "
+                     f"{rx_packet.trace_hops} hops ({len(rx_packet.tracepath)} bytes), "
+                     f"{len(rx_packet.path)} results")
 
         if not rx_packet.trace_completed:
             logger.debug("Incomplete trace, ignoring")
@@ -678,8 +680,14 @@ class CompanionRadio(BasicMesh):
         # It's possible this is someone else's trace. In which case, the tag won't match and the client
         # should discard it
 
-        # Hop count, not byte count — they differ once entries are wider than one byte.
-        msg = (bytes([PUSH_CODE_TRACE_DATA, 0, rx_packet.trace_hops, rx_packet.flags])
+        # BYTE count of the path hashes, not the hop count. Upstream writes
+        #     out_frame[2] = path_len;  memcpy(..., path_hashes, path_len);
+        #     memcpy(..., path_snrs, path_len >> path_sz);
+        # so the client uses this one byte for BOTH: it reads that many hash bytes, then
+        # derives the SNR count from it as `path_len >> (flags & 3)`. Sending the hop count
+        # instead makes a multi-byte trace read short on the hashes and then mis-split the
+        # SNRs — the two counts only coincide for 1-byte hashes.
+        msg = (bytes([PUSH_CODE_TRACE_DATA, 0, len(rx_packet.tracepath), rx_packet.flags])
                + rx_packet.tag + rx_packet.auth)
 
         # Path hashes

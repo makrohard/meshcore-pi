@@ -1396,7 +1396,11 @@ class MC_Trace(MC_Incoming):
         s += f"\nTrace tag: {hexlify(self.tag).decode()}"
         s += f"\nAuth code: {hexlify(self.auth).decode()}"
         s += f"\nFlags: {self.flags}"
-        s += f"\nPath: {pathstr(self.tracepath)}"
+        # Group by entry width, or a multi-byte route prints as twice as many hops.
+        _sz = self.trace_hash_size
+        _hops = [self.tracepath[i:i + _sz].hex()
+                 for i in range(0, len(self.tracepath) - _sz + 1, _sz)]
+        s += f"\nPath: {','.join(_hops)}"
         s += f"\nSNR: {[snr/4 for snr in struct.unpack('b' * len(self.path), self.path)]}"
         return s
 
@@ -1453,14 +1457,18 @@ class MC_Trace_Out(MC_Outgoing):
         # a TRACE, is a zero-hop direct path)
         self.tracepath = bytes(path)
         # Entries are `1 << (flags & 3)` bytes wide; the route must be a whole number of
-        # them, or the far end walks it misaligned.
-        entry = 1 << (self.flags[0] & 0x03)
+        # them, or the far end walks it misaligned. The LIMIT is on HOPS, not bytes:
+        # upstream checks `(path_len >> path_sz) > MAX_PATH_SIZE`, because the 64-byte cap
+        # belongs to the SNR array (one byte per hop) while the route itself travels in the
+        # payload. A 33-hop route of 2-byte hashes is 66 bytes and is perfectly legal.
+        path_sz = self.flags[0] & 0x03
+        entry = 1 << path_sz
         if len(self.tracepath) % entry:
             raise ValueError("Trace path is not a whole number of hops")
+        if (len(self.tracepath) >> path_sz) > self.MAX_PATH_SIZE:
+            raise ValueError("Trace path has too many hops")
         if len(self.tracepath) < 1:
             raise ValueError("Path is too short")
-        if len(self.tracepath) > self.MAX_PATH_SIZE:
-            raise ValueError("Path is too long")
         
     # Trace payload consists of
     # tag - 4 bytes
