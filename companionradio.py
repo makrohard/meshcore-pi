@@ -674,9 +674,38 @@ class CompanionRadio(BasicMesh):
             frame = await self.appinterface.rx()
             response = None
 
+            if not frame:
+                # An empty frame carries no command. Nothing to answer, nothing to log
+                # loudly about — just wait for the next one.
+                continue
+
             command = frame[0]
 
             logger.debug(f"Command received: {command}, frame = {hexlify(frame).decode()}, length = {len(frame )}")
+
+            try:
+              response = await self._handle_command(command, frame)
+            except (IndexError, struct.error, ValueError, UnicodeDecodeError) as e:
+                # A TRUNCATED OR MALFORMED frame must not take the node down. Handlers index
+                # their arguments directly, so a short frame used to raise straight out of
+                # this loop and end command processing for the life of the process — a
+                # denial of service from one bad frame.
+                logger.warning(f"Malformed frame for command {command}: {type(e).__name__}")
+                response = ERR(ERR_CODE_ILLEGAL_ARG)
+
+            if response is None:
+                logger.debug("No response to send")
+            elif isinstance(response, list):
+                for c,r in enumerate(response):
+                    logger.debug(f"Sending response {c+1}/{len(response)}")
+                    await self.appinterface.tx(r)
+            else:
+                logger.debug("Sending response")
+                await self.appinterface.tx(response)
+
+    async def _handle_command(self, command, frame):
+            """Handle one command frame and return the response (or None / a list)."""
+            response = None
 
             if command == CMD_APP_START:
                 logger.debug("CMD_APP_START")
@@ -901,13 +930,16 @@ class CompanionRadio(BasicMesh):
                 logger.debug(f"CMD_DEVICE_QUERY, app protocol version:{self.app_protocol_version}")
 
                 if self.app_protocol_version <3:
+                    # Refuse the COMMAND, not the connection. `break` here left the serving
+                    # loop for good, so one frame from an old or confused client silently
+                    # stopped the node answering anything ever again.
                     logger.error("Protocol version < 3 not supported")
-                    break
-
-                # We haven't really defined the maximum number of contacts.
-                # Maximum channels is arbritarily set in channel.py
-                # Set it to the max, 510 (255*2). Set the BLE PIN code to 123456
-                response = device_info_resp(len(self.channels))
+                    response = ERR(ERR_CODE_UNSUPPORTED_CMD)
+                else:
+                    # We haven't really defined the maximum number of contacts.
+                    # Maximum channels is arbritarily set in channel.py
+                    # Set it to the max, 510 (255*2). Set the BLE PIN code to 123456
+                    response = device_info_resp(len(self.channels))
 
             elif command == CMD_GET_BATT_AND_STORAGE:
                 logger.debug(f"CMD_GET_BATT_AND_STORAGE")
@@ -1035,15 +1067,7 @@ class CompanionRadio(BasicMesh):
                 logger.warning(f"Unsupported command: {command}")
                 response = ERR(ERR_CODE_UNSUPPORTED_CMD)
 
-            if response is None:
-                logger.debug("No response to send")
-            elif isinstance(response, list):
-                for c,r in enumerate(response):
-                    logger.debug(f"Sending response {c+1}/{len(response)}")
-                    await self.appinterface.tx(r)
-            else:
-                logger.debug("Sending response")
-                await self.appinterface.tx(response)
+            return response
 
     async def start(self):
         # Start the mesh
