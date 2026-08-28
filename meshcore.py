@@ -84,6 +84,10 @@ dispatcher.pass_internal = config.get('dispatcher.pass_internal', False)
 # Configure devices
 
 devices = []
+# Optional live-position sources, collected while configuring devices and started with the
+# rest of the tasks: (device name, NMEA endpoint, baud, stale-after seconds).
+positionsources = []
+identities = {}
 
 device_list = config.get('devices', None)
 
@@ -136,6 +140,19 @@ for device in device_list:
     else:
         latlon = None
 
+    # OPTIONAL live position. `gps.device` points at anything that emits NMEA — a receiver,
+    # or a PTY fed by whatever owns the receiver. Unset (the default) means the static
+    # lat/lon above are used exactly as before and nothing here runs.
+    gps_device = data.get('gps.device')
+    if gps_device:
+        from nmeaposition import NMEAPosition, DEFAULT_STALE_AFTER
+        positionsources.append((
+            device,
+            str(gps_device),
+            int(data.get('gps.baud', 9600)),
+            float(data.get('gps.stale_after', DEFAULT_STALE_AFTER)),
+        ))
+
     ids_file = data.get('contacts')
     if ids_file is None:
         logger.debug("No identity file configured, using memory store")
@@ -153,6 +170,7 @@ for device in device_list:
         channels = groupchannel.channels(channelfile, numchannels, add_public)
 
         me = SelfIdentity(private_key=private_key, name=name, latlon=latlon, devicetype=AdvertType.CHAT)
+        identities[device] = me
 
         from companionradio import CompanionRadio
 
@@ -161,6 +179,7 @@ for device in device_list:
 
     elif device_type == "room":
         me = SelfIdentity(private_key=private_key, name=name, latlon=latlon, devicetype=AdvertType.ROOM)
+        identities[device] = me
 
         from roomserver import Room
 
@@ -169,6 +188,7 @@ for device in device_list:
 
     elif device_type == "repeater":
         me = SelfIdentity(private_key=private_key, name=name, latlon=latlon, devicetype=AdvertType.REPEATER)
+        identities[device] = me
 
         from repeater import Repeater
 
@@ -206,6 +226,19 @@ async def main():
             await d.start()
 
             print(f"Started {d.internalname}, {d.me.name.decode(errors='replace')}")
+
+        # Start any configured live-position sources. Each keeps its device's identity
+        # current from an NMEA stream; with none configured this loop does nothing and the
+        # static lat/lon stand.
+        for devname, endpoint, baud, stale_after in positionsources:
+            me = identities.get(devname)
+            if me is None:
+                logger.error(f"Device {devname} has a GPS source but no identity")
+                continue
+            from nmeaposition import NMEAPosition
+            source = NMEAPosition(me, endpoint, baud=baud, stale_after=stale_after)
+            tg.create_task(source.run(), name=f"NMEA position ({devname})")
+            print(f"Live position source for {devname}: {endpoint}")
 
         # Start stats printer
         # Writes stats every 5 minutes to stdout; disabled by default

@@ -108,6 +108,22 @@ device = "wlan0"
 # Default is to create a new private/public key
 # privatekey="[insert hex private key here]"
 
+# Optional LIVE position from an NMEA stream, instead of the static lat/lon above.
+#
+# Point gps.device at anything that emits NMEA sentences: a receiver, or a PTY fed by
+# whatever owns the receiver (gpsd, a bridge, a replay). This node deliberately knows
+# nothing about the source — no gpsd client, no device discovery, no receiver ownership.
+#
+# Unset (the default) = no live position: the static lat/lon are used exactly as before.
+# When set, valid fixes update the node's position so later adverts carry it. The endpoint
+# may appear later than this node starts; it is retried. If no valid fix arrives for
+# gps.stale_after seconds the live position is CLEARED (reverting to the static lat/lon, or
+# to no position) rather than advertising where the node used to be; it recovers by itself
+# when fixes resume. A live fix is never written back to this file.
+# gps.device = "/dev/ttyACM0"
+# gps.baud = 9600
+# gps.stale_after = 60
+
 # Default is no latitude/longitude
 # lat = 0
 # lon = 0
