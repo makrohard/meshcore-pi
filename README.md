@@ -1,3 +1,17 @@
+> [!IMPORTANT]
+> **Unmaintained fork, archived (read-only).**
+>
+> This fork added a `loraham` interface so meshcore-pi could drive a LoRaHAM Pi
+> HAT through `loraham_daemon`. That work is no longer maintained here.
+>
+> - The MeshCore node in **LoRaHAM Pi Control** now runs on
+>   [openHop Core](https://github.com/openhop-dev/openhop_core), as of LHPC v0.2.3.
+> - Upstream meshcore-pi is unaffected and continues at
+>   [brianwiddas/meshcore-pi](https://github.com/brianwiddas/meshcore-pi).
+>
+> Nothing is deleted. The daemon-interface work stays readable at
+> [`loraham-daemon-interface`](https://github.com/makrohard/meshcore-pi/tree/419a383074203b56b1b8cf0e587c8d0e3461be55).
+
 Implementing Meshcore in python
 ===============================
 
